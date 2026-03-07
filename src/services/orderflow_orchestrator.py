@@ -156,6 +156,7 @@ class OrderFlowOrchestrator:
         packet['vwap'] = local_vwap
         packet['vqs_score'] = local_vqs
         packet['vol_surge'] = local_surge
+        packet['vol_delta'] = diff # Track if volume actually moved (Real Tick vs Depth Update)
         
         return packet
 
@@ -345,6 +346,10 @@ class OrderFlowOrchestrator:
         Fallback system 1: Momentum Squeeze
         Triggers purely on extreme volume surges and price action quality.
         """
+        # --- FIX: Avoid double-logging on non-trade packets (e.g. depth updates) ---
+        if packet.get('vol_delta', 0) <= 0:
+            return
+
         vol_surge = packet.get('vol_surge', 1.0)
         vqs_score = packet.get('vqs_score', 0.0)
         vwap = packet.get('vwap', ltp)
@@ -367,7 +372,7 @@ class OrderFlowOrchestrator:
         vwap = packet.get('vwap', 0.0)
         vol_surge = packet.get('vol_surge', 1.0)
         
-        if vwap <= 0 or vol_surge < self.vwap_vol_surge:
+        if vwap <= 0 or vol_surge < self.vwap_vol_surge or packet.get('vol_delta', 0) <= 0:
             return
             
         deviation = (ltp - vwap) / vwap
@@ -385,6 +390,9 @@ class OrderFlowOrchestrator:
         Matches the logic in vol_surge_scanner.py: 10x surge and 0.5% price move.
         This ensures the Orchestrator doesn't miss what the database scanner sees.
         """
+        if packet.get('vol_delta', 0) <= 0:
+            return
+
         vol_surge = packet.get('vol_surge', 1.0)
         
         # We need the 1-candle price move (simulated for streaming)
