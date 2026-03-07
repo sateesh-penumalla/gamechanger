@@ -1,0 +1,22 @@
+# Cloudflare Tunnel Configuration (cloudflared.yml)
+# This resolves your Dhan Webhook SSL / Health Check failure.
+# 1. Install cloudflared on your VM: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started-guide/local/
+# 2. Run 'cloudflared tunnel login'
+# 3. Create a tunnel: 'cloudflared tunnel create bharatquant-webhook'
+# 4. Use the UUID from step 3 in the 'tunnel' field below.
+
+tunnel: YOUR_TUNNEL_UUID_HERE
+credentials-file: /root/.cloudflared/YOUR_TUNNEL_UUID_HERE.json
+
+ingress:
+  # Map your webhook domain (e.g., api.marginos.app) to the local FastAPI port
+  - hostname: api.marginos.app
+    service: http://localhost:8000
+    originRequest:
+      noTLSVerify: true  # Bypasses local SSL check, using Cloudflare's cert instead
+  
+  # Health check or landing page
+  - hostname: webhook-check.marginos.app
+    service: http://localhost:8000/health
+
+  - service: http_status:404

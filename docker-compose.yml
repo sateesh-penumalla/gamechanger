@@ -1,0 +1,138 @@
+version: '3.8'
+
+services:
+  # Database Service (MySQL)
+  db:
+    image: mysql:8.0
+    container_name: mimic_lab_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: bharatquant_sniper
+    ports:
+      - "3307:3306" # Expose on 3307 to avoid conflict with local MySQL
+    volumes:
+      - db_data:/var/lib/mysql
+
+  # Backend Service (FastAPI)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: mimic_lab_backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=mysql+pymysql://root:root@db/bharatquant_sniper
+      - REDIS_HOST=redis
+      - ENABLE_AUTO_TRADING=false
+    env_file: .env
+    depends_on:
+      - db
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+
+  # Frontend Service (Production/Static)
+  frontend:
+    build:
+      context: ./frontend/control-panel
+      dockerfile: Dockerfile
+    container_name: mimic_lab_frontend
+    restart: always
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+  # NEW: Frontend Dev Service (for hot-reloading)
+  frontend-dev:
+    image: node:22-alpine
+    container_name: mimic_lab_frontend_dev
+    working_dir: /app
+    volumes:
+      - ./frontend/control-panel:/app
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    command: sh -c "npm install && npm run dev -- --host"
+    depends_on:
+      - backend
+
+  # Redis Service (Pub/Sub for Live Data)
+  redis:
+    image: redis:alpine
+    container_name: mimic_lab_redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+  # Market Depth Service (TrueData WebSocket -> Redis)
+  market-depth:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: mimic_lab_market_depth
+    restart: always
+    environment:
+      - DATABASE_URL=mysql+pymysql://root:root@db/bharatquant_sniper
+      - REDIS_HOST=redis
+      - ENABLE_AUTO_TRADING=false
+    env_file: .env
+    command: python3 -m src.services.market_depth_service_v2
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+  # Signal Generator Service (Strategy Loop)
+  # signal-generator:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.backend
+  #   container_name: mimic_lab_signal_generator
+  #   restart: always
+  #   environment:
+  #     - DATABASE_URL=mysql+pymysql://root:root@db/bharatquant_sniper
+  #     - REDIS_HOST=redis
+  #   env_file: .env
+  #   command: python3 -m src.services.signal_generator
+  #   depends_on:
+  #     - db
+  #     - redis
+  #     - market-depth
+  #   volumes:
+  #     - ./src:/app/src
+  #     - ./data:/app/data
+
+  # Order Flow Orchestrator (Live Institutional Pattern Detection)
+  # orderflow-orchestrator:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.backend
+  #   container_name: mimic_lab_orderflow_orchestrator
+  #   restart: always
+  #   environment:
+  #     - DATABASE_URL=mysql+pymysql://root:root@db/bharatquant_sniper
+  #     - REDIS_HOST=redis
+  #   env_file: .env
+  #   command: python3 -m src.services.orderflow_orchestrator
+  #   depends_on:
+  #     - db
+  #     - redis
+  #     - market-depth
+  #   volumes:
+  #     - ./src:/app/src
+  #     - ./data:/app/data
+
+volumes:
+  db_data:
+
+
+networks:
+  default:
+    name: mimic_lab_network
+    driver: bridge

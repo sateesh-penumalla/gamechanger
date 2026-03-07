@@ -1,0 +1,11 @@
+node_modules
+__pycache__
+*.pyc
+.git
+frontend/control-panel/dist
+frontend/control-panel/node_modules
+**/.venv
+**/venv
+.pytest_cache
+.coverage
+htmlcov
