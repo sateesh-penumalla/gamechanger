@@ -197,3 +197,49 @@ pkill -f "src.services.orderflow_orchestrator"
 export ENABLED_SIGNALS=MOMENTUM_SQUEEZE
 export PYTHONPATH=$PYTHONPATH:.
 python3 -m src.services.orderflow_orchestrator > logs_momentum_only.txt 2>&1 &
+
+
+
+The MOMENTUM_SQUEEZE strategy is a high-conviction momentum breakout system that operates in five distinct stages. It is designed to capture rapid price expansions that are backed by "smart money" (institutional) volume surges.
+
+Here is the step-by-step breakdown of how it works:
+
+1. The Independent Metric Engine
+Instead of relying on delayed exchange data, the system calculates its own real-time metrics for every stock tick it receives from the Dhan API:
+
+Local VWAP: It calculates the Volume Weighted Average Price from the very first tick of the day.
+Volume Surge: It compares the volume of the latest tick to the average tick volume over the last 100 ticks.
+VQS (Velocity Quality Score): This measures the "cleanliness" of the move. If every tick is higher than the previous one, the VQS is +1.0. If they are alternating, it drops toward 0.
+2. The Squeeze Triggers (Thresholds)
+The system continuously monitors all stocks in your focus list. A MOMENTUM_SQUEEZE is only flagged when the following "Gold Guard" thresholds are met simultaneously:
+
+Volume Surge must be ≥ 12x the average volume. This ensures we are only entering when there is an actual explosion of activity.
+VQS Score must be ≥ 0.70 (for Long) or ≤ -0.70 (for Short). This filters out "choppy" price action and only targets "one-way" directional moves.
+3. Directional Alignment (The Logic)
+Once the surge is detected, the system determines the direction:
+
+LONG SQUEEZE:
+Price must be Above VWAP.
+VQS must be positive (≥ 0.70).
+SHORT SQUEEZE:
+Price must be Below VWAP.
+VQS must be negative (≤ -0.70).
+4. The "Gold Guard" & Safety Filters
+Before a signal is actually generated, it passes through three final safety gates:
+
+Sniper Alignment: The stock must have been identified by the OracleAgent earlier in the day as an UP_SNIPER (for Longs) or DOWN_SNIPER (for Shorts). If the signal is Long but the stock is a Down Sniper, it is ignored.
+Precision Balance (35% - 65%): The system checks the Order Book imbalance. If the Bid % is > 65% or < 35%, it considers the move "exhausted" or "one-sided" and skips it.
+Debounce Timer: To prevent "over-trading," the system will only allow one signal per stock every 5 minutes.
+5. Automated Execution
+If ENABLE_AUTO_TRADING is set to true, the system immediately fires a Dhan Super Order:
+
+Entry: Market/Limit order at current price.
+Stop Loss (SL): Set strictly at 2% from the entry price.
+Take Profit (TP): Set strictly at 1% from the entry price (as per your current configuration).
+Summary Table
+Metric	Threshold	Rationale
+Volume Surge	12x	Minimum required intensity to confirm institutional entry.
+VQS Score	0.70	Ensures price is moving in a straight, high-velocity line.
+VWAP	Above/Below	Confirms the trend is holding above the day's average cost.
+Precision	35% to 65%	Prevents entering into "overcrowded" trades.
+In the logs I reviewed earlier, you can see these surges being rejected if they don’t hit the 12.0x surge or 0.7 VQS required for the "Gold Guard" protection.
