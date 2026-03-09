@@ -44,9 +44,19 @@ class PortfolioManager:
         """Manages lifecycle of positions: Pending -> Open -> Closed."""
         session = self.Session()
         try:
-            # 1. Process PENDING signals (Entry Execution)
+            # 1. Load latest config
             config = self._get_config(session)
             
+            # 2. Cache current Dhan positions once to avoid multiple API calls
+            # returns None on API error/expiry, [] on no positions
+            remote_positions = self.dhan_client.get_positions()
+            
+            if remote_positions is None:
+                logger.error("🚫 CRITICAL: Dhan API Authentication failed (Token Expired?). Skipping sync to protect DB state.")
+            else:
+                logger.info(f"📊 Dhan Connectivity Verified. Account has {len(remote_positions)} open positions.")
+            
+            # 2. Process PENDING signals (Entry Execution)
             pending_pos = session.query(Position).filter(Position.status == 'PENDING').all()
             for pos in pending_pos:
                 # Initialize TP/SL based on latest config if not set
@@ -54,12 +64,12 @@ class PortfolioManager:
                     tp_mult = 1 + (config.get('tp_pct', 2.0) / 100) if pos.side == 'LONG' else 1 - (config.get('tp_pct', 2.0) / 100)
                     pos.tp = pos.entry_price * tp_mult
 
-                self._execute_entry(session, pos)
+                self._execute_entry(session, pos, remote_positions)
 
-            # 2. Manage OPEN positions (Exit Logic)
+            # 3. Manage OPEN positions (Exit Logic)
             open_pos = session.query(Position).filter(Position.status == 'OPEN').all()
             for pos in open_pos:
-                self._manage_trade(session, pos, config)
+                self._manage_trade(session, pos, config, remote_positions)
             
             session.commit()
             if pending_pos or open_pos:
@@ -71,7 +81,7 @@ class PortfolioManager:
         finally:
             session.close()
 
-    def _execute_entry(self, session, pos) -> tuple[bool, str]:
+    def _execute_entry(self, session, pos, remote_positions=None) -> tuple[bool, str]:
         """Places order on Dhan and updates status to OPEN. Returns (success, message)."""
         # --- DOUBLE-ENTRY GUARD ---
         # 1. Proactive Sync: If we think it's OPEN, check Dhan one last time.
@@ -81,26 +91,17 @@ class PortfolioManager:
             Position.status == 'OPEN'
         ).first()
         
-        if existing:
-            try:
-                logger.info(f"Double-Entry Guard: Checking Dhan status for existing {pos.symbol} position...")
-                d_pos = self.dhan_client.get_positions()
-                remote_qty = 0
-                for dp in d_pos:
-                    if dp.get('tradingSymbol', '').replace(".NS", "") == pos.symbol:
-                        remote_qty = abs(int(dp.get('netQty', 0)))
-                        break
-                
-                if remote_qty == 0:
-                    logger.info(f"✅ Dhan confirmed {pos.symbol} is CLOSED. Syncing DB before allowing new entry.")
-                    existing.status = 'CLOSED'
-                    existing.exit_time = datetime.now()
-                    existing.exit_reason = "Exchange Sync"
-                    existing.agent_audit_log += "\n[Sync] Closed on Dhan. Guard cleared."
-                    session.flush()
-                    existing = None # Clear the guard!
-            except Exception as e:
-                logger.error(f"Error during proactive guard sync: {e}")
+        if existing and remote_positions is not None:
+            # Check the pre-fetched list for this symbol
+            remote_qty = self._get_remote_qty(pos.symbol, remote_positions)
+            if remote_qty == 0:
+                logger.info(f"✅ Dhan confirmed {pos.symbol} is CLOSED. Syncing DB before allowing new entry.")
+                existing.status = 'CLOSED'
+                existing.exit_time = datetime.now()
+                existing.exit_reason = "Exchange Sync"
+                existing.agent_audit_log += "\n[Sync] Closed on Dhan. Guard cleared."
+                session.flush()
+                existing = None # Clear the guard!
 
         if existing:
             msg = f"Skipped: Position already OPEN for {pos.symbol}"
@@ -253,29 +254,19 @@ class PortfolioManager:
             pos.agent_audit_log += f"\n[Exit] FAILED to place Dhan exit order."
             logger.info(f"Position {pos.symbol} exit FAILED.")
 
-    def _manage_trade(self, session, pos, config):
+    def _manage_trade(self, session, pos, config, remote_positions):
         """Checks SL/TP/Trailing for an open position."""
         # --- PROACTIVE SYNC: Check if Dhan closed this already ---
-        if pos.status == 'OPEN':
-            try:
-                # Throttle Dhan API calls? Maybe only every 10 seconds per symbol?
-                # For now, lean check:
-                d_pos = self.dhan_client.get_positions()
-                remote_qty = 0
-                for dp in d_pos:
-                    if dp.get('tradingSymbol', '').replace(".NS", "") == pos.symbol:
-                        remote_qty = abs(int(dp.get('netQty', 0)))
-                        break
-                
-                if remote_qty == 0:
-                    logger.info(f"✅ Auto-Sync: {pos.symbol} found CLOSED on Dhan. Updating DB.")
-                    pos.status = 'CLOSED'
-                    pos.exit_time = datetime.now()
-                    pos.exit_reason = "Dhan Sync"
-                    pos.agent_audit_log += "\n[Sync] Detected closed on Dhan exchange side."
-                    return # No more management needed
-            except Exception as e:
-                logger.error(f"Error during manage_trade sync: {e}")
+        if pos.status == 'OPEN' and remote_positions is not None:
+            # Check the pre-fetched list
+            remote_qty = self._get_remote_qty(pos.symbol, remote_positions)
+            if remote_qty == 0:
+                logger.info(f"✅ Auto-Sync: {pos.symbol} found CLOSED on Dhan. Updating DB.")
+                pos.status = 'CLOSED'
+                pos.exit_time = datetime.now()
+                pos.exit_reason = "Dhan Sync"
+                pos.agent_audit_log += "\n[Sync] Detected closed on Dhan exchange side."
+                return # No more management needed
 
         # Get latest price
         last_tick = session.query(IntradayTick).filter(IntradayTick.symbol == pos.symbol)\
@@ -318,36 +309,34 @@ class PortfolioManager:
         # if pos.rider_active and ...
         
         if exit_triggered:
-            # If it's a Super Order, check Dhan first to avoid double-entry/exit
-            if pos.target_order_id or pos.sl_order_id:
-                logger.info(f"Exit Triggered locally for {pos.symbol}. Checking Dhan status...")
-                try:
-                    d_pos = self.dhan_client.get_positions()
-                    remote_qty = 0
-                    for dp in d_pos:
-                        if dp.get('tradingSymbol', '').replace(".NS", "") == pos.symbol:
-                            remote_qty = abs(int(dp.get('netQty', 0)))
-                            break
-                    
-                    if remote_qty == 0:
-                        logger.info(f"✅ Dhan already closed {pos.symbol} (Super Order Hit). Syncing status.")
-                        pos.status = 'CLOSED'
-                        pos.exit_time = datetime.now()
-                        pos.exit_reason = reason
-                        pos.pnl_pct = cur_pnl_pct
-                        pos.pnl_abs = (curr_price - pos.entry_price) * pos.qty if pos.side == 'LONG' else (pos.entry_price - curr_price) * pos.qty
-                        pos.agent_audit_log += f"\n[Super Order Sync] Verified CLOSED on Dhan via {reason}."
-                        return
-                    else:
-                        logger.warning(f"⚠️ Dhan position still open for {pos.symbol}. Manual exit required or wait for Super Order.")
-                except Exception as e:
-                    logger.error(f"Error syncing Super Order status: {e}")
+            # If it's a Super Order, check the pre-fetched positions
+            if (pos.target_order_id or pos.sl_order_id) and remote_positions is not None:
+                remote_qty = self._get_remote_qty(pos.symbol, remote_positions)
+                if remote_qty == 0:
+                    logger.info(f"✅ Dhan already closed {pos.symbol} (Super Order Hit). Syncing status.")
+                    pos.status = 'CLOSED'
+                    pos.exit_time = datetime.now()
+                    pos.exit_reason = reason
+                    pos.pnl_pct = cur_pnl_pct
+                    pos.pnl_abs = (curr_price - pos.entry_price) * pos.qty if pos.side == 'LONG' else (pos.entry_price - curr_price) * pos.qty
+                    pos.agent_audit_log += f"\n[Super Order Sync] Verified CLOSED on Dhan via {reason}."
+                    return
+                else:
+                    logger.warning(f"⚠️ Dhan position still open for {pos.symbol}. Manual exit required or wait for Super Order.")
 
             # Standard exit if not a super order or still open/unknown
             self._execute_exit(session, pos, reason)
             # Update PnL
             pos.pnl_pct = cur_pnl_pct
             pos.pnl_abs = (curr_price - pos.entry_price) * pos.qty if pos.side == 'LONG' else (pos.entry_price - curr_price) * pos.qty
+
+    def _get_remote_qty(self, symbol, remote_positions):
+        """Helper to find quantity for a symbol in pre-fetched Dhan positions."""
+        if not remote_positions: return 0
+        for dp in remote_positions:
+            if dp.get('tradingSymbol', '').replace(".NS", "") == symbol:
+                return abs(int(dp.get('netQty', 0)))
+        return 0
 
 if __name__ == "__main__":
     pm = PortfolioManager()

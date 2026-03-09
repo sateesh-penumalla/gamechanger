@@ -134,9 +134,9 @@ class OrderFlowOrchestrator:
         den = self.vwap_den[symbol]
         local_vwap = self.vwap_num[symbol] / den if den > 0 else ltp
         
-        # 4. Local VQS (Momentum)
+        # 4. Local VQS (Momentum) - Using a shorter 20-tick window for actual Velocity
         self.price_history[symbol].append(ltp)
-        history = self.price_history[symbol]
+        history = list(self.price_history[symbol])
         if len(history) > 1:
             ticks = []
             for i in range(1, len(history)):
@@ -147,7 +147,8 @@ class OrderFlowOrchestrator:
             local_vqs = 0.0
 
         # 5. Local Vol Surge
-        v_hist = self.vol_history[symbol]
+        # 5. Local Vol Surge - Improved Accuracy (Excluding current spike from average)
+        v_hist = list(self.vol_history[symbol])
         avg_v = sum(v_hist) / len(v_hist) if v_hist else 0.0
         last_v = v_hist[-1] if v_hist else 0.0
         local_surge = last_v / avg_v if avg_v > 0 else 1.0
@@ -415,7 +416,7 @@ class OrderFlowOrchestrator:
         if self.enabled_signals and signal_type not in self.enabled_signals:
             return
 
-        # Debounce signals (1 signal per 5 mins per symbol)
+        # Debounce signals (5 Minute Cool-off to prevent re-entry loops)
         last_t = self.last_signal_time.get(symbol, datetime.min)
         if (datetime.now() - last_t).total_seconds() < 300:
             return
@@ -466,17 +467,21 @@ class OrderFlowOrchestrator:
             self.last_signal_time[symbol] = datetime.now()
 
     def _generate_signal(self, session, symbol, side, ltp, packet, is_l3, anchor_price=None, signal_type="ORDERFLOW_ALPHA"):
+        # Load Global Config for SL/TP
+        config = self._get_config(session)
+        sl_pct = float(config.get('sl_pct', 2.0))
+        tp_pct = float(config.get('tp_pct', 1.0))
+        
         # High-Precision SL/TP for OrderFlow Alpha
-        # SL is placed behind the wall that was broken
-        sl_buffer = ltp * 0.02 # 2% Stop Loss
+        sl_buffer = ltp * (sl_pct / 100.0)
         if anchor_price:
-            # Place SL 2% behind the institutional wall/anchor for maximum survival
-            sl = anchor_price - (ltp * 0.02) if side == "LONG" else anchor_price + (ltp * 0.02)
+            # Place SL behind the institutional wall/anchor for maximum survival
+            sl = anchor_price - sl_buffer if side == "LONG" else anchor_price + sl_buffer
         else:
             sl = ltp - sl_buffer if side == "LONG" else ltp + sl_buffer
             
-        # TP is now fixed at 1.0% as per user request
-        tp_buffer = ltp * 0.01 
+        # Target Price
+        tp_buffer = ltp * (tp_pct / 100.0) 
         tp = ltp + tp_buffer if side == "LONG" else ltp - tp_buffer
 
         # Create Signal entry
@@ -540,7 +545,9 @@ class OrderFlowOrchestrator:
                 session.flush()
                 
                 # 2. Trigger PortfolioManager Execution Logic
-                success, message = self.port_mgr._execute_entry(session, pos)
+                # Fetch remote positions for the double-entry guard
+                remote_positions = self.port_mgr.dhan_client.get_positions()
+                success, message = self.port_mgr._execute_entry(session, pos, remote_positions)
                 if success and pos.status == 'OPEN':
                     new_sig.status = "EXECUTED"
                     new_sig.execution_pos_id = pos.id

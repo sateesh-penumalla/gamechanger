@@ -476,8 +476,11 @@ def execute_position(pos_id: int, db: Session = Depends(get_db)):
     if pos.status not in ['SIGNALED', 'PENDING']:
         raise HTTPException(status_code=400, detail="Only SIGNALED or PENDING positions can be executed.")
     
+    # Fetch remote positions for the double-entry guard
+    remote_positions = port_mgr.dhan_client.get_positions()
+    
     # Trigger execution logic 
-    success, message = port_mgr._execute_entry(db, pos)
+    success, message = port_mgr._execute_entry(db, pos, remote_positions)
     db.commit()
     
     if not success:
@@ -520,7 +523,9 @@ def execute_signal(sig_id: int, db: Session = Depends(get_db)):
     
     # 2. Trigger PortfolioManager Execution Logic
     try:
-        success, message = port_mgr._execute_entry(db, pos)
+        # Fetch remote positions for the double-entry guard
+        remote_positions = port_mgr.dhan_client.get_positions()
+        success, message = port_mgr._execute_entry(db, pos, remote_positions)
         
         if success and pos.status == 'OPEN':
             # 3. Update Signal Status on success

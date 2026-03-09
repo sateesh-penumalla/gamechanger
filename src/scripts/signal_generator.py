@@ -496,7 +496,9 @@ class SignalGenerator:
             
             # 2. Trigger PortfolioManager Execution Logic
             try:
-                success, message = self.port_mgr._execute_entry(session, pos)
+                # Fetch remote positions for the double-entry guard
+                remote_positions = self.port_mgr.dhan_client.get_positions()
+                success, message = self.port_mgr._execute_entry(session, pos, remote_positions)
                 if success and pos.status == 'OPEN':
                     sig.status = "EXECUTED"
                     sig.execution_pos_id = pos.id

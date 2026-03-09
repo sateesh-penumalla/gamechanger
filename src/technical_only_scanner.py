@@ -186,23 +186,26 @@ def technical_only_scan():
             librarian.record_recommendation(db_rec)
 
     # 6. Final Report
-    print("\n" + "="*80)
-    print("BHARATQUANT PROFESSIONAL WAR ROOM REPORT")
-    print("="*80)
-    if not recommendations:
-        print("No high-conviction trades found at this time.")
-    else:
-        for r in recommendations:
-            print(f"SYMBOL: {r['symbol']} | ACTION: {r['action']} | CONFIDENCE: {r['confidence']}%")
-            print(f"   ENTRY: ₹{r['entry']} | EXIT-SL: ₹{r['sl']}")
-            print(f"   INTRADAY TARGETS: T1: ₹{r['t1']} | T2: ₹{r['t2']}")
-            if r.get("t3"):
-                print(f"   HYBRID SWING (CARRY FORWARD):")
-                print(f"    - Target 3: ₹{r['t3']}")
-                print(f"    - Trailing SL: ₹{r['trailing_sl']} (Daily 9/20 EMA)")
-                print(f"    - RATIONALE: Carry forward if targets not met by 3:10 PM and price > Day Median.")
-            print("-" * 40)
-    print("="*80 + "\n")
+    try:
+        print("\n" + "="*80)
+        print("BHARATQUANT PROFESSIONAL WAR ROOM REPORT")
+        print("="*80)
+        if not recommendations:
+            print("No high-conviction trades found at this time.")
+        else:
+            for r in recommendations:
+                print(f"SYMBOL: {r['symbol']} | ACTION: {r['action']} | CONFIDENCE: {r['confidence']}%")
+                print(f"   ENTRY: ₹{r['entry']} | EXIT-SL: ₹{r['sl']}")
+                print(f"   INTRADAY TARGETS: T1: ₹{r['t1']} | T2: ₹{r['t2']}")
+                if r.get("t3"):
+                    print(f"   HYBRID SWING (CARRY FORWARD):")
+                    print(f"    - Target 3: ₹{r['t3']}")
+                    print(f"    - Trailing SL: ₹{r['trailing_sl']} (Daily 9/20 EMA)")
+                    print(f"    - RATIONALE: Carry forward if targets not met by 3:10 PM and price > Day Median.")
+                print("-" * 40)
+        print("="*80 + "\n")
+    finally:
+        session.close()
 
 if __name__ == "__main__":
     technical_only_scan()

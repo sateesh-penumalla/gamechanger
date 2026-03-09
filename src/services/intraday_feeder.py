@@ -12,7 +12,6 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from src.db.schema import IntradayTick, DailyFocus, SystemJob
 from src.data.dhan_client import DhanDataClient
-from src.data.truedata_client import TrueDataClient
 
 load_dotenv()
 
@@ -25,7 +24,7 @@ class IntradayFeeder:
     def __init__(self):
         self.db_url = os.getenv("DATABASE_URL")
         self.dhan_client = DhanDataClient()
-        self.td_client = TrueDataClient()
+        self.td_client = None # Delayed initialization if needed
         self.engine = create_engine(self.db_url)
         self.Session = sessionmaker(bind=self.engine)
         

@@ -243,3 +243,6 @@ VQS Score	0.70	Ensures price is moving in a straight, high-velocity line.
 VWAP	Above/Below	Confirms the trend is holding above the day's average cost.
 Precision	35% to 65%	Prevents entering into "overcrowded" trades.
 In the logs I reviewed earlier, you can see these surges being rejected if they don’t hit the 12.0x surge or 0.7 VQS required for the "Gold Guard" protection.
+
+
+docker-compose restart backend market-depth

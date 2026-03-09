@@ -26,7 +26,6 @@ services:
     environment:
       - DATABASE_URL=mysql+pymysql://root:root@db/bharatquant_sniper
       - REDIS_HOST=redis
-      - ENABLE_AUTO_TRADING=false
     env_file: .env
     depends_on:
       - db
@@ -79,7 +78,6 @@ services:
     environment:
       - DATABASE_URL=mysql+pymysql://root:root@db/bharatquant_sniper
       - REDIS_HOST=redis
-      - ENABLE_AUTO_TRADING=false
     env_file: .env
     command: python3 -m src.services.market_depth_service_v2
     depends_on:

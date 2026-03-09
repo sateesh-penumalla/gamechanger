@@ -15,7 +15,6 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 # Custom Imports
-from src.data.truedata_client import TrueDataClient
 from src.data.dhan_client import DhanDataClient
 from src.data.dhan_feed_v2 import DhanFeedClient
 from src.db.schema import DailyFocus, IntradayTick, Ticker
@@ -44,7 +43,7 @@ logger.info(f"MarketDepthService Logging Initialized: {log_file}")
 
 class MarketDepthService:
     """
-    Ingests Real-Time Market Depth (Level 2) & Ticks from TrueData.
+    Ingests Real-Time Market Depth (Level 2) & Ticks from DhanHQ (Official Feed).
     Calculates Order Flow Metrics.
     Publishes to Redis Pub/Sub.
     """
@@ -55,13 +54,12 @@ class MarketDepthService:
     
     def __init__(self, symbols=None):
         self.symbols = symbols # Will fetch if None
-        self.td_client = None
         self.redis_client = None
         self.running = True
-        self.mode = os.getenv("TRUEDATA_MODE", "PRODUCTION").upper()
+        self.mode = os.getenv("MODE", "PRODUCTION").upper()
         self.use_mock = (self.mode == "MOCK")
         self.enable_bse_bridge = os.getenv("ENABLE_BSE_BRIDGE", "true").lower() == "true"
-        self.depth_source = os.getenv("DEPTH_SOURCE", "TRUEDATA").upper()
+        self.depth_source = os.getenv("DEPTH_SOURCE", "DHAN").upper()
         self.enable_dhan_deep_depth = os.getenv("ENABLE_DHAN_DEEP_DEPTH", "true").lower() == "true"
         
         # Database setup
@@ -75,9 +73,10 @@ class MarketDepthService:
         self.dhan_data = DhanDataClient() # Helper for ID mapping
         self.dhan_feed = None
         
-        if self.depth_source == "TRUEDATA":
-            self._setup_truedata()
-        elif self.depth_source == "DHAN":
+        if self.depth_source == "DHAN":
+            self._setup_dhan_feed()
+        else:
+            logger.warning(f"Unsupported depth source: {self.depth_source}. Defaulting to Dhan.")
             self._setup_dhan_feed()
         
         # Buffering for metrics calculation
@@ -196,20 +195,7 @@ class MarketDepthService:
                 time.sleep(1)
 
 
-    def _setup_truedata(self):
-        user = os.getenv("TRUEDATA_USER_ID")
-        pwd = os.getenv("TRUEDATA_PASSWORD")
-        
-        if self.use_mock:
-            logger.info("TRUEDATA_MODE is MOCK. Skipping login.")
-            return
-
-        if not user or not pwd:
-            logger.warning("TrueData Credentials Missing. Switching to MOCK MODE.")
-            self.use_mock = True
-            return
-
-        self.td_client = TrueDataClient(user, pwd)
+    # TrueData Setup Removed (Deprecated)
 
     def _setup_dhan_feed(self):
         cid = os.getenv("DHAN_CLIENT_ID")
@@ -344,10 +330,7 @@ class MarketDepthService:
                 df = None
                 source_tag = "UNKNOWN_PRIME"
                 
-                if self.depth_source == "TRUEDATA" and self.td_client:
-                    df = self.td_client.fetch_intraday_bars(symbol, today_open, now)
-                    source_tag = "TRUEDATA_PRIME"
-                elif self.depth_source == "DHAN" and self.dhan_data:
+                if self.depth_source == "DHAN" and self.dhan_data:
                     # Dhan fetch_realtime_data expects string date or period
                     from_date_str = today_open.strftime("%Y-%m-%d")
                     df = self.dhan_data.fetch_realtime_data(symbol, interval="1m", from_date_str=from_date_str)
@@ -387,7 +370,7 @@ class MarketDepthService:
                                     "low": float(row['Low']),
                                     "close": float(row['Close']),
                                     "volume": int(row['Volume']),
-                                    "source": "DHAN_REST_FEEDER" if self.depth_source == "DHAN" else "TRUEDATA_REST_FEEDER"
+                                    "source": f"{self.depth_source}_PRIME"
                                 }
                                 if earliest_ts and clean_ts < earliest_ts:
                                     self.redis_client.lpush(bar_key, json.dumps(bar))
@@ -473,7 +456,7 @@ class MarketDepthService:
                 logger.error(f"Error priming {symbol}: {e}")
 
     def _process_tick(self, data):
-        """Callback for TrueData ticks. Merges Trade (LTP) and Bid/Ask (Depth) updates statefully."""
+        """Callback for Feed ticks. Merges Trade (LTP) and Bid/Ask (Depth) updates statefully."""
         try:
             # 1. Standardize data (handles dict for mock, objects for live)
             if isinstance(data, dict):
@@ -481,7 +464,7 @@ class MarketDepthService:
                 update_type = 'depth' if 'bid_price' in data or 'bid_list' in data else 'trade'
             else:
                 symbol = getattr(data, 'symbol', None)
-                # TrueData-ws: TradeLiveData has 'ltp', bidask_feed has 'bid'/'ask'
+                # Unified Feed: Process Trade and Depth updates
                 update_type = 'depth' if hasattr(data, 'bid') or hasattr(data, 'ask') else 'trade'
 
             if not symbol: return
@@ -782,51 +765,12 @@ class MarketDepthService:
             self.option_chain_thread = threading.Thread(target=self._run_option_chain_loop, daemon=True)
             self.option_chain_thread.start()
             
-            if self.depth_source == "TRUEDATA":
-                self._run_truedata()
-            elif self.depth_source == "DHAN":
+            if self.depth_source == "DHAN":
                 self._run_dhan()
+            else:
+                logger.error(f"Unsupported depth source: {self.depth_source}")
 
-    def _run_truedata(self):
-            # Automatically add BSE counterparts for subscription to enable the Bridge
-            MAX_TOTAL_SLOTS = 200
-            full_subscription_list = []
-            mirrored_count = 0
-            
-            # 1. Try to add pairs for all focus symbols up to the limit
-            for s in self.symbols:
-                if len(full_subscription_list) >= MAX_TOTAL_SLOTS:
-                    break
-                
-                # Add NSE
-                full_subscription_list.append(s)
-                
-                # Add BSE Mirror (_BSE suffix) if enabled
-                if self.enable_bse_bridge and len(full_subscription_list) < MAX_TOTAL_SLOTS:
-                    full_subscription_list.append(f"{s}_BSE")
-                    mirrored_count += 1
-            
-            # Special case for SENSEX mood
-            if self.enable_bse_bridge and "SENSEX" not in full_subscription_list and len(full_subscription_list) < MAX_TOTAL_SLOTS:
-                full_subscription_list.append("SENSEX")
-
-            logger.info(f"MarketDepthService Started. Monitoring {len(self.symbols)} NSE symbols. Bridge Enabled: {self.enable_bse_bridge}. Pairs created for {mirrored_count} stocks. Total Subs: {len(full_subscription_list)}")
-            logger.debug(f"FULL SUBSCRIPTION LIST: {full_subscription_list}")
-            
-            # Start flush thread
-            self.flush_thread = threading.Thread(target=self._flush_to_storage, daemon=True)
-            self.flush_thread.start()
-
-            # Start Actual WebSocket
-            self.td_client.start_websocket(full_subscription_list, on_tick=self._process_tick)
-            
-            # Keep main thread alive
-            while self.running:
-                try:
-                    time.sleep(1)
-                except KeyboardInterrupt:
-                    self.stop()
-                    break
+    # _run_truedata Removed (Deprecated)
 
     def _run_dhan(self):
         """Initializes and runs the Dhan 20-level depth feed."""
