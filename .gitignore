@@ -160,8 +160,10 @@ cython_debug/
 # --- Project Specific ---
 
 # Data and Cache
-data/
+data/*
+!data/historical_ticks/
 *.csv
+!data/historical_ticks/**/*.csv
 !sec_list.csv
 !sec_list_bkp.csv
 !sec_list_mini.csv
@@ -195,6 +197,7 @@ init-letsencrypt.sh
 # Media and Archives
 *.wav
 *.zip
+!data/historical_ticks_*.zip
 *.json
 !document.json
 !frontend/package.json
