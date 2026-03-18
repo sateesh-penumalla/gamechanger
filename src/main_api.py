@@ -729,14 +729,14 @@ async def dhan_postback(request: Request, db: Session = Depends(get_db)):
                     pos.status = 'OPEN'
                     if not pos.entry_price or pos.entry_price == 0:
                         pos.entry_price = float(payload.get('price', 0))
-                    pos.agent_audit_log += f"\n[Webhook] ENTRY Order TRADED at {payload.get('updateTime')}"
+                    pos.agent_audit_log = (pos.agent_audit_log or "") + f"\n[Webhook] ENTRY Order TRADED at {payload.get('updateTime')}"
                 else:
                     # Likely an EXIT order (Target/SL)
                     pos.status = 'CLOSED'
                     pos.exit_time = datetime.now()
                     pos.exit_price = float(payload.get('price', 0))
                     pos.exit_reason = "Webhook Trade"
-                    pos.agent_audit_log += f"\n[Webhook] EXIT Order TRADED at {payload.get('updateTime')}"
+                    pos.agent_audit_log = (pos.agent_audit_log or "") + f"\n[Webhook] EXIT Order TRADED at {payload.get('updateTime')}"
                     
                     # --- CRITICAL: CLEAR THE ORIGINATING SIGNAL FOR RE-ARMING ---
                     sig = db.query(ORBSignal).filter(ORBSignal.execution_pos_id == pos.id).first()
@@ -759,7 +759,7 @@ async def dhan_postback(request: Request, db: Session = Depends(get_db)):
                     if sig: sig.status = "REJECTED"
                 else:
                     # If it's an exit order that failed, we keep status as is for monitoring
-                    pos.agent_audit_log += f"\n[Webhook] EXIT Order {status}: {payload.get('omsErrorDescription')}"
+                    pos.agent_audit_log = (pos.agent_audit_log or "") + f"\n[Webhook] EXIT Order {status}: {payload.get('omsErrorDescription')}"
             
             db.commit()
             return {"status": "success", "pos_id": pos.id}

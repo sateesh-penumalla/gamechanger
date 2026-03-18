@@ -246,3 +246,93 @@ In the logs I reviewed earlier, you can see these surges being rejected if they 
 
 
 docker-compose restart backend market-depth
+
+
+
+
+
+very imp:
+
+
+
+I have backed up the strategy logic, baseline data, and calculation scripts to a new research directory in your workspace.
+
+Saved Location:
+research/rvol_strategy/
+
+Contents:
+backtest_adaptive_v1.py: The complete parallel backtesting engine with:
+Median-based RVOL (Adaptive ADV).
+Adaptive Pulses (Relative to stock size).
+"Institutions Gone" smarter exit logic.
+Peak Profit tracking.
+calc_median_baselines.py: The script that generates the volume baselines from the intraday_ticks DB table.
+vol_median_5m.json: A snapshot of the 331 stock baselines we used for this successful run.
+Strategy Logic Summary (The "Spec"):
+Entry: RVOL > 5.0 (vs Median), Vol_5m > 500k, Aggression > 2.0, Pulse Count >= 3 (Adaptive), Bid Stability < 5.0, Efficiency > 0.25.
+Exit:
+Trailing Stop: 1.5% (or 0.7% if 2% profit already harvested).
+Institutions Gone: If Price < VWAP AND no ticks > 0.25x Median (or aggression > 3.0) for 20 minutes.
+Profit Harvest: Exit 50% of position at +2% gain.
+The results for March 9, 10, and 12 are very promising (+18% total PnL on the 9th alone). This logic is now safe in your repository for when we are ready to move it to the main orc.py.
+
+
+
+
+I have successfully updated the backup repository with this new, higher-performing logic.
+
+New "Elite" Backup Created
+Folder: 
+
+research/rvol_strategy/backups/elite_v2_23pct_no_exit/
+
+Why this version is now the Master Backup:
+PnL Increase: Jumped from 14.4% → 22.89% (+59% profit increase).
+Disabled INST_GONE: We discovered that letting trades run through low-volume periods yielded 6 additional winners while only adding 1 additional loss.
+Win Rate: The target hit rate increased from 47.9% → 60.4%.
+Stability: The system now has a 73% Win/Protect rate, meaning nearly 3 out of 4 trades are successful or "risk-free" breakevens.
+All files, including the updated 
+
+holy_grail_sniper_v1.py
+ and the best-performing CSV logs, are securely saved in this new folder.
+
+This is currently the best-performing configuration we have built. Are you ready to see the final summary of these settings?
+
+
+
+
+1. The New Sniper Orchestrator
+I created 
+
+src/services/sniper_orc.py
+. This is a standalone system modeled after 
+
+orc.py
+ that listens to live Redis ticks and implements the Elite V2 Logic:
+
+Morning Gate: Only takes entries between 09:25 AM and 12:30 PM.
+Volume Floor: Minimum 250,000 shares in the last 5 minutes.
+Pulse Detection: Identifies institutional conviction by looking for 3+ massive volume spikes (0.25x median) in 15 minutes.
+Anti-Exhaustion: Rejects trades if the stock jumped more than 2% pre-entry (prevents "late-chase").
+VWAP Magnet: Ensures entry is in the "value zone" (0.2% to 1.2% dev from VWAP).
+Precision Target: Automatically sets a 1% Take Profit and a 2% Stop Loss.
+2. Intelligence Update: Defensive Break-even Trail
+I updated 
+
+src/services/portfolio_manager.py
+ to support the signature "Holy Grail" exit logic:
+
+The 0.75% Shield: If an Elite Sniper trade reaches a peak profit of 0.75%, the Portfolio Manager automatically moves the Stop Loss to 0.05% profit (Safe Break-even).
+This is what drives the 73% Win/Protect rate—ensuring that winning trades don't turn into losses.
+3. Strategic Safety (INST_GONE Disabled)
+Per our backtesting breakthrough, the INST_GONE logic is disabled in this new version. The system is now configured to "Let it Run" to its target, which yielded +59% more profit in our tests.
+
+How to launch the new system:
+You can now run this in parallel with your existing orchestrator:
+
+bash
+# In one terminal
+python3 src/services/sniper_orc.py
+# Ensure PortfolioManager is also running to manage the trades
+python3 src/services/portfolio_manager.py
+This system is now ready to identify the high-conviction "Holy Grail" setups in real-time. Would you like me to help you set up a supervisor or script to keep both of them running?

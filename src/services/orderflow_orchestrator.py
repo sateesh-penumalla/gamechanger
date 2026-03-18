@@ -16,6 +16,9 @@ from src.services.portfolio_manager import PortfolioManager
 from src.utils.notifications import notify_new_signal
 
 load_dotenv()
+os.makedirs("logs", exist_ok=True)
+logger.add("logs/orderflow_orchestrator.log", rotation="500 MB", level="DEBUG", retention="10 days")
+logger.info("OrderFlowOrchestrator logging to logs/orderflow_orchestrator.log")
 
 class OrderFlowOrchestrator:
     """
@@ -50,16 +53,18 @@ class OrderFlowOrchestrator:
         self.vwap_den = defaultdict(float)
         self.last_reset_date = date.today()
         self.prev_volume = defaultdict(int) # Track session volume for delta logic
+        self.open_prices = {} # Track morning open (09:15) for extension guard
+        self.nifty_vqs = 0.0 # Global Market Sentiment Cache
         
         # Config
-        self.min_iceberg_score = 0.8  # Tightened from 0.7
-        self.imbalance_trigger = 0.4  # Tightened from 0.3
-        self.vqs_trigger = 0.5        # Tightened from 0.15
-        self.refill_multiplier = 15.0 # Tightened from 10.0
+        self.min_iceberg_score = 0.85 # Tightened from 0.8
+        self.imbalance_trigger = 0.6  # Tightened from 0.4
+        self.vqs_trigger = 0.7        # Tightened from 0.5
+        self.refill_multiplier = 20.0 # Tightened from 15.0
         
         # Fallback Config (For Gold Guard precision)
-        self.momentum_vol_surge = 12.0 
-        self.momentum_vqs = 0.70      
+        self.momentum_vol_surge = 15.0 # Tightened from 12.0
+        self.momentum_vqs = 0.85       # Tightened from 0.7
         self.vwap_deviation_pct = 0.025 
         self.vwap_vol_surge = 12.0    
         
@@ -108,6 +113,7 @@ class OrderFlowOrchestrator:
             self.price_history.clear()
             self.vol_history.clear()
             self.prev_volume.clear()
+            self.open_prices.clear()
             self.last_reset_date = today
 
         # 2. VWAP & Volume Surge
@@ -129,12 +135,47 @@ class OrderFlowOrchestrator:
             self.vol_history[symbol].append(diff)
         
         self.prev_volume[symbol] = current_v
+        
+        if symbol == "NIFTY":
+            # 1. Expand Window for Smoother Sentiment
+            if self.price_history[symbol].maxlen < 300:
+                current_hist = list(self.price_history[symbol])
+                self.price_history[symbol] = deque(current_hist, maxlen=300)
+            
+            # 2. Ghost Tick Filter: Ignore impossible jumps back to the open price
+            open_p = self.open_prices.get("NIFTY")
+            if open_p and len(self.price_history[symbol]) > 0:
+                prev_ltp = self.price_history[symbol][-1]
+                if abs(ltp - prev_ltp) > 50 and abs(ltp - open_p) < 0.5:
+                    logger.warning(f"🛡️ NIFTY GHOST TICK DETECTED: Jumped from {prev_ltp} to {ltp} (Open: {open_p}). Filtering.")
+                    return packet
 
+        # 2a. Track morning baseline for Extension Guard (Sync with DB if missing)
+        if symbol not in self.open_prices:
+            now_time = datetime.now().time()
+            if now_time >= dt_time(9, 15):
+                try:
+                    with self.Session() as session:
+                        from sqlalchemy import text
+                        res = session.execute(text(
+                            "SELECT open FROM intraday_ticks WHERE symbol = :s AND date(timestamp) = :d ORDER BY timestamp ASC LIMIT 1"
+                        ), {"s": symbol, "d": date.today()}).first()
+                        if res:
+                            self.open_prices[symbol] = float(res[0])
+                            logger.info(f"Morning open for {symbol} synced from DB: {self.open_prices[symbol]}")
+                        else:
+                            # If DB doesn't have it yet, this is the first tick at/after 9:15
+                            self.open_prices[symbol] = ltp
+                            logger.info(f"Morning open for {symbol} set from first 9:15 tick: {ltp}")
+                except Exception as e:
+                    logger.error(f"Error fetching open price for {symbol}: {e}")
+                    self.open_prices[symbol] = ltp
+        
         # 3. Local VWAP Value
         den = self.vwap_den[symbol]
         local_vwap = self.vwap_num[symbol] / den if den > 0 else ltp
         
-        # 4. Local VQS (Momentum) - Using a shorter 20-tick window for actual Velocity
+        # 4. Local VQS (Momentum) - Using full 100-tick window for smooth Velocity
         self.price_history[symbol].append(ltp)
         history = list(self.price_history[symbol])
         if len(history) > 1:
@@ -159,6 +200,28 @@ class OrderFlowOrchestrator:
         packet['vol_surge'] = local_surge
         packet['vol_delta'] = diff # Track if volume actually moved (Real Tick vs Depth Update)
         
+        # 6. Global Sentiment Cache (NIFTY)
+        # Optimized: We track NIFTY just like any other symbol, but cache its VQS globally
+        # so other signals can reference it without extra calculations.
+        if symbol == "NIFTY":
+            self.nifty_vqs = local_vqs
+            # Trend Bias: If market is up > 0.4% on the day, keep sentiment bullish even during small flat spots
+            open_p = self.open_prices.get("NIFTY")
+            raw_vqs = local_vqs
+            day_change = 0.0
+            if open_p:
+                day_change = (ltp - open_p) / open_p
+                # Dynamic Threshold: 0.15 base + proportional boost for stronger trends
+                # e.g. 0.8% move results in ~0.31 floor
+                dynamic_floor = min(0.5, 0.15 + max(0, (abs(day_change) - 0.004) * 40))
+                
+                if day_change >= 0.004 and self.nifty_vqs < dynamic_floor:
+                    self.nifty_vqs = dynamic_floor # Bullish Override
+                elif day_change <= -0.004 and self.nifty_vqs > -dynamic_floor:
+                    self.nifty_vqs = -dynamic_floor # Bearish Override
+                    
+            logger.debug(f"Market Sentiment Updated (NIFTY): LTP={ltp:.1f} | Change={day_change*100:.2f}% | RawVQS={raw_vqs:.2f} | FinalVQS={self.nifty_vqs:.4f}")
+
         return packet
 
     def run(self):
@@ -205,13 +268,13 @@ class OrderFlowOrchestrator:
         
         fs_imbalance = (total_bid_qty - total_ask_qty) / combined if combined > 0 else 0
         
-        # 3. Absorption Detection
-        self._detect_absorption(symbol, ltp, bids, asks, fs_imbalance, packet, is_l3)
+        # 3. Absorption Detection (DISABLED - Momentum Squeeze Only)
+        # self._detect_absorption(symbol, ltp, bids, asks, fs_imbalance, packet, is_l3)
         
-        # 4. Fallback Detection (Momentum Surge & VWAP Extension)
+        # 4. Fallback Detection (Momentum Surge ONLY)
         self._detect_momentum_surge(symbol, ltp, packet, is_l3)
-        self._detect_vwap_extension(symbol, ltp, packet, is_l3)
-        self._detect_db_style_breakout(symbol, ltp, packet, is_l3) # New: Scanner Alignment
+        # self._detect_vwap_extension(symbol, ltp, packet, is_l3)
+        # self._detect_db_style_breakout(symbol, ltp, packet, is_l3)
         
         # Store state for next tick comparison
         self.prev_state[symbol] = packet
@@ -290,6 +353,10 @@ class OrderFlowOrchestrator:
                     del self.absorption_stats[sym][price]
 
     def _detect_absorption(self, symbol, ltp, bids, asks, fs_imbalance, packet, is_l3):
+        # --- FIX: Only evaluate absorption triggers on Trade ticks ---
+        if packet.get('vol_delta', 0) <= 0:
+            return
+
         vqs_score = packet.get('vqs_score', 0.0)
         
         # 1. Check for active "Authentic Iceberg" Walls
@@ -354,16 +421,22 @@ class OrderFlowOrchestrator:
         vol_surge = packet.get('vol_surge', 1.0)
         vqs_score = packet.get('vqs_score', 0.0)
         vwap = packet.get('vwap', ltp)
+        imbalance = packet.get('imbalance', 0.0)
         
+        # Guard: Avoid chasing spikes > 1.0% from VWAP
+        vwap_dist_pct = abs(ltp - vwap) / vwap * 100 if vwap > 0 else 0
+        if vwap_dist_pct > 1.0:
+            return
+
         if vol_surge >= self.momentum_vol_surge:
-            # LONG: VQS positive and price above VWAP
-            if vqs_score >= self.momentum_vqs and ltp > vwap:
-                logger.warning(f"🚀 MOMENTUM SQUEEZE (LONG): {symbol} @ {ltp} | Surge: {vol_surge}x | VQS: {vqs_score} | VWAP: {vwap}")
-                self._evaluate_trigger(symbol, "LONG", ltp, packet, is_l3, signal_type="MOMENTUM_SQUEEZE")
-            # SHORT: VQS negative and price below VWAP
-            elif vqs_score <= -self.momentum_vqs and ltp < vwap:
-                logger.warning(f"\033[91m🩸 MOMENTUM SQUEEZE (SHORT): {symbol} @ {ltp} | Surge: {vol_surge}x | VQS: {vqs_score} | VWAP: {vwap}\033[0m")
-                self._evaluate_trigger(symbol, "SHORT", ltp, packet, is_l3, signal_type="MOMENTUM_SQUEEZE")
+            # LONG: VQS positive, price > VWAP, and actual Buy Imbalance in order book
+            if vqs_score >= self.momentum_vqs and ltp > vwap and imbalance >= 0.25:
+                # Tightened extension for fallback: 2.0%
+                self._evaluate_trigger(symbol, "LONG", ltp, packet, is_l3, signal_type="MOMENTUM_SQUEEZE", max_extension=2.0)
+            
+            # SHORT: VQS negative, price < VWAP, and actual Sell Imbalance
+            elif vqs_score <= -self.momentum_vqs and ltp < vwap and imbalance <= -0.25:
+                self._evaluate_trigger(symbol, "SHORT", ltp, packet, is_l3, signal_type="MOMENTUM_SQUEEZE", max_extension=2.0)
 
     def _detect_vwap_extension(self, symbol, ltp, packet, is_l3):
         """
@@ -411,39 +484,67 @@ class OrderFlowOrchestrator:
             logger.warning(f"🔍 SCANNER ALIGNMENT ({side}): {symbol} @ {ltp} | Surge: {vol_surge:.1f}x | Move: {price_move_pct:.2%}")
             self._evaluate_trigger(symbol, side, ltp, packet, is_l3, signal_type="SCANNER_BREAKOUT")
 
-    def _evaluate_trigger(self, symbol, side, ltp, packet, is_l3, anchor_price=None, signal_type="ORDERFLOW_ALPHA"):
-        # Filter by enabled signal types if configured
-        if self.enabled_signals and signal_type not in self.enabled_signals:
+    def _evaluate_trigger(self, symbol, side, ltp, packet, is_l3, anchor_price=None, signal_type="ORDERFLOW_ALPHA", max_extension=3.5):
+        # --- TIME WINDOW GUARD: 09:15 to 14:30 ---
+        now_time = datetime.now().time()
+        start_time = dt_time(9, 1)
+        end_time = dt_time(14, 30)
+        
+        if now_time < start_time or now_time > end_time:
+            # logger.debug(f"Orchestrator: Signal outside trading window ({now_time}). Ignoring.")
             return
 
-        # Debounce signals (5 Minute Cool-off to prevent re-entry loops)
+        # 1. Redis Global Lock (Absolute Once-Per-Day per Stock)
+        now = datetime.now()
+        lock_key = f"lock:trade:{symbol}:{now.date()}"
+        if self.redis_client.exists(lock_key):
+            return
+
+        # 2. Memory Debounce (Strict Once per Day per Stock)
         last_t = self.last_signal_time.get(symbol, datetime.min)
-        if (datetime.now() - last_t).total_seconds() < 300:
+        if last_t.date() >= now.date():
             return
 
         with self.Session() as session:
+            # 3. DB Guard (Absolute One-Trade-Per-Day per Stock for TODAY)
+            from src.db.schema import Position
+            today = now.date()
+            existing_today = session.query(Position).filter(
+                Position.symbol == symbol,
+                Position.date == today
+            ).first()
+            
+            if existing_today:
+                self.redis_client.setex(lock_key, 86400, "1") # Sync Redis
+                self.last_signal_time[symbol] = now # Sync memory
+                logger.warning(f"🛡️ Orchestrator Guard: {symbol} already has a record for today (ID: {existing_today.id}, Status: {existing_today.status}). Entry blocked.")
+                return
 
-            # --- GOLD GUARD: Sniper Alignment Check ---
-            # Symbols must be in DailyFocus and have matching sniper status
-            from src.db.schema import DailyFocus
+            # SET LOCK IMMEDIATELY to prevent race conditions
+            self.redis_client.setex(lock_key, 86400, "1")
+            self.last_signal_time[symbol] = now
+
+            # --- EXTENSION GUARD: 2.5% Boundary ---
+            # Rule: Don't chase a move that has already fallen/risen too much.
+            open_p = self.open_prices.get(symbol)
+            if open_p:
+                move_pct = ((ltp - open_p) / open_p) * 100
+                if side == "LONG" and move_pct > max_extension:
+                    logger.debug(f"Orchestrator: {symbol} LONG over-extended ({move_pct:.2f}% > {max_extension}%). Ignoring.")
+                    return
+                if side == "SHORT" and move_pct < -max_extension:
+                    logger.debug(f"Orchestrator: {symbol} SHORT over-extended ({move_pct:.2f}% < -{max_extension}%). Ignoring.")
+                    return
+
+            # --- DYNAMIC WATCHLIST CHECK: Must be in DailyFocus ---
+            # Even if we ignore Oracle Status, we only trade symbols in our universe for the day.
             focus = session.query(DailyFocus).filter(
                 DailyFocus.symbol == symbol,
                 DailyFocus.date == date.today()
             ).first()
             
             if not focus:
-                # logger.debug(f"Orchestrator: {symbol} not in DailyFocus. Ignoring signal.")
-                return
-
-            # Match Status to Side
-            is_valid_sniper = False
-            if side == "LONG" and focus.oracle_status == "UP_SNIPER":
-                is_valid_sniper = True
-            elif side == "SHORT" and focus.oracle_status == "DOWN_SNIPER":
-                is_valid_sniper = True
-            
-            if not is_valid_sniper:
-                # logger.debug(f"Orchestrator: {symbol} status {focus.oracle_status} does not match signal side {side}. Ignoring.")
+                logger.debug(f"Orchestrator: {symbol} ignored. Not in Today's DailyFocus watchlist.")
                 return
 
             # --- PRECISION BALANCE: 35% - 65% Filter ---
@@ -455,13 +556,26 @@ class OrderFlowOrchestrator:
                 logger.debug(f"Orchestrator: {symbol} balance {strength:.1f}% outside 35-65 range. Ignoring.")
                 return
 
+            # --- MARKET ALIGNMENT: NIFTY Sentiment Filter ---
+            # Rule: Don't fight the market. Signal direction must match NIFTY's momentum.
+            # Long only if Nifty VQS > 0.25. Short only if Nifty VQS < -0.25.
+            is_aligned = False
+            if side == "LONG" and self.nifty_vqs > 0.1:
+                is_aligned = True
+            elif side == "SHORT" and self.nifty_vqs < -0.1:
+                is_aligned = True
+            
+            if not is_aligned:
+                logger.debug(f"Orchestrator: {symbol} {side} avoided. Against Market Sentiment (NIFTY VQS: {self.nifty_vqs:.2f})")
+                return
+
             # PURE ALPHA / FALLBACK: Generate signal immediately if trigger conditions met.
             depth_label = "L3" if is_l3 else "L2"
             
             if side == "SHORT":
-                logger.success(f"\033[91m🔥 {signal_type} SIGNAL (GOLD GUARD): {symbol} | {side} @ {ltp} | Vol Surge: {packet.get('vol_surge', 'None')}x\033[0m")
+                logger.success(f"\033[91m🔥 {signal_type} SIGNAL (DYNAMIC): {symbol} | {side} @ {ltp} | Vol Surge: {packet.get('vol_surge', 'None')}x\033[0m")
             else:
-                logger.success(f"🔥 {signal_type} SIGNAL (GOLD GUARD): {symbol} | {side} @ {ltp} | Vol Surge: {packet.get('vol_surge', 'None')}x")
+                logger.success(f"🔥 {signal_type} SIGNAL (DYNAMIC): {symbol} | {side} @ {ltp} | Vol Surge: {packet.get('vol_surge', 'None')}x")
                 
             self._generate_signal(session, symbol, side, ltp, packet, is_l3, anchor_price, signal_type)
             self.last_signal_time[symbol] = datetime.now()
@@ -514,6 +628,12 @@ class OrderFlowOrchestrator:
         session.flush() # Get ID
         
         # --- AUTO-EXECUTE LOGIC ---
+        master_switch = os.getenv("ENABLE_AUTO_TRADING", "false").lower() == "true"
+        if not master_switch:
+            logger.warning(f"🛡️ Orchestrator: {symbol} signal detected but ENABLE_AUTO_TRADING is FALSE. Skipping position.")
+            session.commit()
+            return
+
         p = self._get_config(session)
         auto_exec = False
         if side == 'LONG' and p.get('auto_execute_long', False): 

@@ -1,119 +1,166 @@
+
 import os
 import pandas as pd
 import numpy as np
-import glob
+from datetime import datetime
 from collections import deque
+from tqdm import tqdm
+from sqlalchemy import create_engine
 
-class MomentumBacktester:
-    def __init__(self, name, surge_threshold, vqs_threshold, target_pct, sl_pct, vol_window_size=50):
-        self.name = name
-        self.surge_threshold = surge_threshold
-        self.vqs_threshold = vqs_threshold
-        self.target_pct = target_pct
-        self.sl_pct = sl_pct
-        self.vol_window_size = vol_window_size
-        self.results = []
-        self.active_trade = None
+# --- Optimized Config (Synchronized with Orchestrator) ---
+MOMENTUM_VOL_SURGE = 12.0
+MOMENTUM_VQS = 0.70
+SL_PCT = 2.0
+TP_PCT = 1.0
+DEBOUNCE_MINS = 5
+MAX_HISTORY = 100
 
-    def run_backtest(self, symbol, data_input):
-        self.active_trade = None
+def get_nifty_sentiment(target_date):
+    """Calculates NIFTY VQS timeline."""
+    path = f"data/ticks/NIFTY/{target_date}.parquet"
+    if not os.path.exists(path): return {}
+    try:
+        df = pd.read_parquet(path)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.sort_values('timestamp')
+        hist = deque(maxlen=MAX_HISTORY)
+        sentiment = {}
+        for _, row in df.iterrows():
+            hist.append(float(row['ltp']))
+            if len(hist) > 1:
+                ticks = np.sign(np.diff(list(hist)))
+                vqs = np.mean(ticks[ticks != 0]) if len(ticks[ticks != 0]) > 0 else 0.0
+                sentiment[row['timestamp']] = vqs
+        return sentiment
+    except: return {}
+
+def run_backtest(target_date="2026-03-09"):
+    # 1. Setup
+    nifty_map = get_nifty_sentiment(target_date)
+    nifty_times = sorted(nifty_map.keys())
+    
+    db_url = "mysql+pymysql://root:root@localhost:3307/bharatquant_sniper"
+    engine = create_engine(db_url)
+    try:
+        focus_df = pd.read_sql(f"SELECT symbol, oracle_status FROM daily_focus WHERE date = '{target_date}'", engine)
+        bias_map = dict(zip(focus_df['symbol'], focus_df['oracle_status']))
+    except: bias_map = {}
+
+    base_dir = "data/ticks"
+    symbols = [d for d in os.listdir(base_dir) if os.path.isdir(f"{base_dir}/{d}") and d != "NIFTY"]
+    
+    all_trades = []
+    
+    print(f"🚀 RE-PROCESSED BACKTEST FOR {target_date} (WARM-UP INCLUDED)")
+    
+    for symbol in tqdm(symbols):
+        file_path = f"{base_dir}/{symbol}/{target_date}.parquet"
+        if not os.path.exists(file_path): continue
+        
         try:
-            if isinstance(data_input, list): # List of batch files
-                df_list = [pd.read_parquet(f) for f in data_input]
-                df = pd.concat(df_list).sort_values('timestamp')
-            else: # Single file or directory
-                df = pd.read_parquet(data_input).sort_values('timestamp')
-        except: return
-
-        if 'ltp' not in df.columns: return
+            df = pd.read_parquet(file_path)
+            if df.empty: continue
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df = df.sort_values('timestamp')
+        except: continue
         
-        ltps = df['ltp'].values
-        if 'buy_vol' in df.columns and 'sell_vol' in df.columns:
-            diffs = df['buy_vol'].values + df['sell_vol'].values
-        elif 'volume' in df.columns:
-            diffs = df['volume'].diff().fillna(0).values
-        else: return
+        # State
+        price_history = deque(maxlen=MAX_HISTORY)
+        vol_history = deque(maxlen=MAX_HISTORY)
+        prev_ttq = 0
+        vwap_num = 0.0
+        vwap_den = 0.0
+        last_signal_time = df.iloc[0]['timestamp'] - pd.Timedelta(days=1)
+        active_trade = None
+        oracle_status = bias_map.get(symbol, "IGNORE")
 
-        timestamps = df['timestamp'].values
-        vwap_num, vwap_den = 0.0, 0.0
-        price_history = deque(maxlen=self.vol_window_size)
-        vol_history = deque(maxlen=self.vol_window_size)
-        
-        for i in range(len(ltps)):
-            ltp, diff, ts = ltps[i], diffs[i], timestamps[i]
-            if ltp <= 0: continue
+        for _, row in df.iterrows():
+            ltp, ttq, ct = float(row['ltp']), int(row['volume']), row['timestamp']
             
-            if diff > 0:
-                vwap_num += (ltp * diff)
-                vwap_den += diff
-                vol_history.append(diff)
-            
+            # 1. Update Metrics regardless of time (WARM-UP)
+            vol_delta = ttq - prev_ttq if ttq > prev_ttq else (ttq if ttq > 0 and prev_ttq == 0 else 0)
+            if vol_delta > 0:
+                vwap_num += (ltp * vol_delta)
+                vwap_den += vol_delta
+                vol_history.append(vol_delta)
+                prev_ttq = ttq
             price_history.append(ltp)
-            if len(vol_history) < 20: continue
-            
             vwap = vwap_num / vwap_den if vwap_den > 0 else ltp
-            h = list(price_history)
-            ticks = [1 if h[j] > h[j-1] else -1 for j in range(1, len(h)) if h[j] != h[j-1]]
-            vqs = sum(ticks)/len(ticks) if ticks else 0
-            surge = diff / np.mean(vol_history) if vol_history else 0
-            
-            if self.active_trade:
-                t = self.active_trade
-                if t['side'] == 'LONG':
-                    if ltp >= t['target']: self._close(t, ltp, ts, 'TARGET HIT')
-                    elif ltp <= t['sl']: self._close(t, ltp, ts, 'STOP LOSS')
+
+            # 2. Handle Active Trade (Allow exits until 15:30)
+            if active_trade:
+                side = active_trade['side']
+                exit_r = None
+                if side == "LONG":
+                    if ltp >= active_trade['tp']: exit_r = "TP"
+                    elif ltp <= active_trade['sl']: exit_r = "SL"
                 else:
-                    if ltp <= t['target']: self._close(t, ltp, ts, 'TARGET HIT')
-                    elif ltp >= t['sl']: self._close(t, ltp, ts, 'STOP LOSS')
+                    if ltp <= active_trade['tp']: exit_r = "TP"
+                    elif ltp >= active_trade['sl']: exit_r = "SL"
                 
-            if not self.active_trade and diff > 0:
-                if surge >= self.surge_threshold and abs(vqs) >= self.vqs_threshold:
-                    if vqs >= self.vqs_threshold and ltp > vwap: 
-                        self._open(symbol, 'LONG', ltp, ts, surge, vqs)
-                    elif vqs <= -self.vqs_threshold and ltp < vwap: 
-                        self._open(symbol, 'SHORT', ltp, ts, surge, vqs)
+                # FINAL EOD EXIT at 15:30
+                if ct.hour >= 15 and ct.minute >= 30: exit_r = exit_r or "EOD_EXIT"
+                
+                if exit_r:
+                    pnl = TP_PCT if exit_r == "TP" else (-SL_PCT if exit_r == "SL" else ( (ltp-active_trade['ent'])/active_trade['ent']*100 if side=="LONG" else (active_trade['ent']-ltp)/active_trade['ent']*100 ))
+                    all_trades.append({
+                        "symbol": symbol, "side": side, "ent_time": active_trade['ent_t'], "exit_time": ct,
+                        "ent_p": active_trade['ent'], "exit_p": ltp, "pnl": round(pnl, 2), "reason": exit_r
+                    })
+                    active_trade = None
+                    last_signal_time = ct
+                continue
 
-    def _open(self, symbol, side, price, ts, surge, vqs):
-        target = price * (1 + self.target_pct) if side == 'LONG' else price * (1 - self.target_pct)
-        sl = price * (1 - self.sl_pct) if side == 'LONG' else price * (1 + self.sl_pct)
-        self.active_trade = {'symbol': symbol, 'side': side, 'entry': price, 'ts': ts, 'target': target, 'sl': sl, 'surge': surge, 'vqs': vqs}
+            # 3. Entry Window Guard (09:15 to 14:30 ONLY)
+            if ct.hour < 9 or (ct.hour == 9 and ct.minute < 15): continue
+            if ct.hour >= 14 and ct.minute >= 30: continue
 
-    def _close(self, t, price, ts, reason):
-        pnl_pct = (price - t['entry'])/t['entry'] if t['side'] == 'LONG' else (t['entry'] - price)/t['entry']
-        try:
-            duration = round(abs((pd.to_datetime(ts) - pd.to_datetime(t['ts'])).total_seconds()) / 60, 1)
-        except: duration = 0.0
-        self.results.append({'Symbol': t['symbol'], 'Side': t['side'], 'PnL%': round(pnl_pct*100, 2), 'Reason': reason, 'Duration': duration, 'Surge': round(t['surge'],1), 'VQS': round(t['vqs'],2)})
-        self.active_trade = None
+            # 5. Signal Evaluation (Strict Filters)
+            if (ct - last_signal_time).total_seconds() < (DEBOUNCE_MINS * 60): continue
+            
+            if len(price_history) > 1 and len(vol_history) > 0:
+                ticks = np.sign(np.diff(list(price_history)))
+                ticks = ticks[ticks != 0]
+                vqs = np.mean(ticks) if len(ticks) > 0 else 0.0
+                
+                v_hist = list(vol_history)
+                surge = v_hist[-1] / (sum(v_hist)/len(v_hist)) if len(v_hist) > 0 else 1.0
+                
+                if surge >= MOMENTUM_VOL_SURGE and abs(vqs) >= MOMENTUM_VQS:
+                    side = "LONG" if vqs > 0 else "SHORT"
+                    
+                    # Gold Guard
+                    if (side == "LONG" and oracle_status != "UP_SNIPER") or (side == "SHORT" and oracle_status != "DOWN_SNIPER"): continue
+                    
+                    # Precision Balance
+                    bp, ap = row.get('bid_pct', 50.0), row.get('ask_pct', 50.0)
+                    strength = bp if side == "LONG" else ap
+                    if not (35.0 <= strength <= 65.0): continue
+                    
+                    # Nifty Market Alignment (Stricter - Dead Zone filter)
+                    idx = np.searchsorted(nifty_times, ct)
+                    nvqs = nifty_map[nifty_times[idx]] if idx < len(nifty_times) else 0.0
+                    
+                    # REVISED STRICTOR CONDITIONS:
+                    # LONG only if NIFTY > +0.25 (Strong Up)
+                    # SHORT only if NIFTY < -0.25 (Strong Down)
+                    if side == "LONG" and nvqs <= 0.25: continue
+                    if side == "SHORT" and nvqs >= -0.25: continue
+                    
+                    active_trade = {
+                        "side": side, "ent": ltp, "ent_t": ct,
+                        "sl": round(ltp * 0.98, 2) if side == "LONG" else round(ltp * 1.02, 2),
+                        "tp": round(ltp * 1.01, 2) if side == "LONG" else round(ltp * 0.99, 2)
+                    }
 
-def report(name, results):
-    if not results: return
-    df = pd.DataFrame(results)
-    wr = (df['Reason'] == 'TARGET HIT').mean() * 100
-    print(f"\n" + "="*95 + f"\nSTRATEGY: {name:10} | Trades: {len(df):3} | WinRate: {wr:5.1f}% | Net: {df['PnL%'].sum():.2f}%\n" + "-"*95)
-    print(df[['Symbol', 'Side', 'PnL%', 'Reason', 'Duration', 'Surge', 'VQS']].sort_values('Symbol').to_string(index=False))
+    trades_df = pd.DataFrame(all_trades)
+    if not trades_df.empty:
+        wr = (len(trades_df[trades_df['pnl'] > 0]) / len(trades_df)) * 100
+        print(f"\n✅ FINAL REPORT: Total PnL: {trades_df['pnl'].sum():.2f}% | Win Rate: {wr:.1f}% | Trades: {len(trades_df)}")
+        trades_df.to_csv(f"backtest_trades_{target_date}.csv", index=False)
+        print("\nTOP TRADES:")
+        print(trades_df.head(20).to_string())
+    else: print("❌ NO TRADES FOUND")
 
 if __name__ == "__main__":
-    # Group batch files by Session (Symbol + Date)
-    session_data = {}
-    for f in glob.glob("data/ticks/*/*.parquet"):
-        symbol = f.split('/')[-2]
-        date_str = os.path.basename(f).split('_')[0].split('.')[0]
-        key = (symbol, date_str)
-        if key not in session_data: session_data[key] = []
-        session_data[key].append(f)
-    
-    # Run comparison on target sessions
-    target_keys = [('TEJASNET', '2026-03-02'), ('BANDHANBNK', '2026-03-02'), ('BANKINDIA', '2026-03-06'), ('BANKBARODA', '2026-03-06')]
-    
-    strategies = [
-        MomentumBacktester("GOLD_GUARD", 8.0, 0.6, 0.005, 0.01, 50),
-        MomentumBacktester("SCALPER_33", 6.0, 0.5, 0.003, 0.006, 33)
-    ]
-
-    for key in target_keys:
-        if key in session_data:
-            for s in strategies: s.run_backtest(key[0], session_data[key])
-
-    print("\n" + "="*95 + "\nFINAL STRATEGY SELECTION BENCHMARK\n" + "="*95)
-    for s in strategies: report(s.name, s.results)
+    run_backtest()

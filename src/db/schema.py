@@ -321,6 +321,20 @@ class HistoryDailyOHLC(Base):
     source = Column(String(20), default="TRUEDATA")
     last_updated = Column(DateTime, default=get_ist_now, onupdate=get_ist_now)
 
+class HistoricalIntradayTick(Base):
+    """Clean historical 1-minute OHLCV data from sources like Dhan"""
+    __tablename__ = 'historical_intraday_ticks'
+    
+    symbol = Column(String(50), primary_key=True)
+    timestamp = Column(DateTime, primary_key=True)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume = Column(Integer)
+    source = Column(String(20)) # e.g. DHAN_HISTORY
+    last_updated = Column(DateTime, default=get_ist_now, onupdate=get_ist_now)
+
 class ORBSignalNearMiss(Base):
     """Signals that failed criteria but are worth tracking"""
     __tablename__ = 'orb_signals_nearmiss'
