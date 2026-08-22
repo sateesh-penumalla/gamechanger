@@ -188,6 +188,9 @@ resolve_*.py
 inspect_*.py
 list_*.py
 dump_*.py
+
+# ...but tests/ is real test code and must be tracked.
+!tests/**
 simulate_*.py
 count_*.py
 patch_*.py

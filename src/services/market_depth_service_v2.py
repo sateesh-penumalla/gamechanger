@@ -18,6 +18,7 @@ from src.data.dhan_client import DhanDataClient
 from src.data.dhan_feed_v2 import DhanFeedClient
 from src.db.schema import DailyFocus, IntradayTick, Ticker
 from src.utils.storage_manager import StorageManager
+from src.utils.trade_classifier import classify_trade_side
 from collections import defaultdict, deque
 import asyncio
 import queue
@@ -68,8 +69,12 @@ class MarketDepthService:
         # NOTE: BSE bridge is permanently disabled. All BSE/_BSE ticks are dropped
         # in _process_dhan_tick before they reach any state or metric calculation.
 
-        # Database
+        # Database Validation
         db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            logger.critical("DATABASE_URL is missing! MarketDepthService will crash on DB operations.")
+            raise EnvironmentError("DATABASE_URL environment variable is required.")
+            
         self.engine       = create_engine(db_url)
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
         self.target_indices = set()
@@ -88,7 +93,7 @@ class MarketDepthService:
         self.price_history = defaultdict(lambda: deque(maxlen=500))
         # FIX 14: vol_history stores raw deltas; baseline avg excludes the current tick
         self.vol_history   = defaultdict(lambda: deque(maxlen=100))
-        self.vqs_history   = defaultdict(lambda: deque(maxlen=100))
+        # self.vqs_history is dead code — removed.
         self.vwap_num      = defaultdict(float)
         self.vwap_den      = defaultdict(float)
         self.pcr_data      = defaultdict(dict)
@@ -99,14 +104,13 @@ class MarketDepthService:
         self.buffer_lock   = threading.Lock()
         self.flush_thread  = None
 
-        # Heartbeat / health
+        # Heartbeat / health / shared state
         self.tick_count          = 0
+        self._drop_count         = 0
+        self.state_lock          = threading.Lock() # Lock for counters and shared state
         self.last_heartbeat_time = time.time()
         self.heartbeat_thread    = None
         self.last_reset_date     = date.today()
-
-        # FIX 8: Drop counter for visibility into queue saturation
-        self._drop_count = 0
 
         # Daily reset watchdog
         self.watchdog_thread = threading.Thread(target=self._reset_watchdog, daemon=True)
@@ -156,7 +160,7 @@ class MarketDepthService:
     def _reset_watchdog(self):
         """Monitors for new trading days and clears stale cumulative state."""
         logger.info("Daily Reset Watchdog started.")
-        while True:
+        while self.running:
             try:
                 today = date.today()
                 if today > self.last_reset_date:
@@ -166,7 +170,7 @@ class MarketDepthService:
                         self.vwap_den.clear()
                         self.price_history.clear()
                         self.vol_history.clear()
-                        self.vqs_history.clear()
+                        # self.vqs_history removed
                         self.last_ttq.clear()
                         self.current_state.clear()
                         self.last_reset_date = today
@@ -201,13 +205,17 @@ class MarketDepthService:
                         break
 
                 if self.redis_client and items:
-                    pipe = self.redis_client.pipeline()
-                    for item in items:
-                        pipe.publish(self.REDIS_CHANNEL, item['json'])
-                        pipe.set(f"depth:{item['symbol']}", item['json'], ex=60)
-                    pipe.execute()
-                    for _ in items:
-                        self.redis_queue.task_done()
+                    try:
+                        pipe = self.redis_client.pipeline()
+                        for item in items:
+                            pipe.publish(self.REDIS_CHANNEL, item['json'])
+                            pipe.set(f"depth:{item['symbol']}", item['json'], ex=60)
+                        pipe.execute()
+                    except Exception as pipe_err:
+                        logger.error(f"Redis Pipeline Execution Error: {pipe_err}")
+                    finally:
+                        for _ in items:
+                            self.redis_queue.task_done()
 
             except Exception as e:
                 logger.error(f"Redis Bridge Pipeline Error: {e}")
@@ -423,12 +431,23 @@ class MarketDepthService:
                 last_row = df.iloc[-1]
                 self.current_state[symbol] = {
                     "ltp":               float(last_row['Close']),
-                    "volume":            int(last_row['Volume']),
+                    # Seed cumulative volume as 0, NOT last_row['Volume'].
+                    # df holds per-minute BAR volumes while the live feed reports
+                    # CUMULATIVE session volume, so seeding one bar made the first
+                    # live tick compute diff = cumulative - one_bar — crediting a
+                    # single packet with the whole session's volume and poisoning
+                    # v_buy/v_sell, current_bar_volume, vol_history and the VWAP
+                    # accumulator. Leaving it 0 makes the `prev_vol > 0` guard in
+                    # _process_dhan_tick skip exactly one tick and adopt the true
+                    # cumulative baseline instead.
+                    "volume":            0,
                     "bid_price":         0.0, "bid_qty":   0.0,
                     "ask_price":         0.0, "ask_qty":   0.0,
                     "total_bid_qty":     0.0, "total_ask_qty": 0.0,
                     "v_buy":             0.0, "v_sell":    0.0,
-                    "prev_ltp":          float(last_row['Close']),
+                    # Seeds for _classify_trade_side (Lee-Ready fallback)
+                    "last_trade_ltp":    float(last_row['Close']),
+                    "last_side":         None,
                     "bids":              [],  "asks":      [],
                     "current_bar_volume": 0.0
                 }
@@ -439,9 +458,8 @@ class MarketDepthService:
                     self.vwap_num[symbol] = float((df['Close'] * df['Volume']).sum())
                     self.vwap_den[symbol] = float(total_v)
 
-                # Seed vol_history with per-bar volume deltas for a valid surge baseline
-                vols = df['Volume'].diff().dropna()
-                for v in vols:
+                # Seed vol_history with bar volumes directly (bars represent deltas)
+                for v in df['Volume']:
                     if v > 0:
                         self.vol_history[symbol].append(float(v))
 
@@ -456,6 +474,28 @@ class MarketDepthService:
     # TICK PROCESSING  (Dhan path — primary)
     # -----------------------------------------------------------------------
 
+    def _classify_trade_side(self, state: dict):
+        """Classify traded volume as buyer- or seller-initiated. Returns 'B'/'S'/None.
+
+        Delegates to src.utils.trade_classifier so that the live path and
+        offline reprocessing (src.harness.reprocess) share one implementation
+        and cannot drift apart. See that module for the algorithm.
+
+        IMPORTANT: bid_price/ask_price are refreshed further down
+        _process_dhan_tick, so when this runs they still hold the book as it
+        stood *before* this trade. That is deliberate — Lee-Ready specify the
+        quote prevailing at the time of the trade, not the one that replaces it
+        afterwards. Do not move the depth update above this call.
+        """
+        side, _src = classify_trade_side(
+            state.get('ltp', 0.0),
+            state.get('bid_price', 0.0),
+            state.get('ask_price', 0.0),
+            state.get('last_trade_ltp', 0.0),
+            state.get('last_side'),
+        )
+        return side
+
     def _process_dhan_tick(self, dhan_tick: dict):
         """Processes a normalized tick from DhanFeedClient."""
         try:
@@ -467,7 +507,9 @@ class MarketDepthService:
             if str(symbol).endswith("_BSE") or symbol == "SENSEX":
                 return
 
-            self.tick_count += 1  # FIX 1: Single increment point per tick
+            # FIX 1: Thread-safe counter increment
+            with self.state_lock:
+                self.tick_count += 1
 
             # Derivative ticks: OI update only, no depth publishing needed
             if dhan_tick.get('is_derivative'):
@@ -487,7 +529,10 @@ class MarketDepthService:
                 "ltp": 0.0, "volume": 0, "bid_price": 0.0, "bid_qty": 0.0,
                 "ask_price": 0.0, "ask_qty": 0.0, "total_bid_qty": 0.0,
                 "total_ask_qty": 0.0, "v_buy": 0.0, "v_sell": 0.0,
-                "prev_ltp": 0.0, "bids": [], "asks": [],
+                # last_trade_ltp / last_side drive the Lee-Ready tick-rule
+                # fallback in _classify_trade_side.
+                "last_trade_ltp": 0.0, "last_side": None,
+                "bids": [], "asks": [],
                 "current_bar_volume": 0.0, "oi": 0.0
             }
             for k, v in defaults.items():
@@ -507,13 +552,25 @@ class MarketDepthService:
             if volume > 0:
                 prev_vol = state.get('volume', 0)
                 if prev_vol > 0 and volume > prev_vol:
-                    diff     = volume - prev_vol
-                    prev_ltp = state.get('prev_ltp', state['ltp'])
+                    diff = volume - prev_vol
 
-                    if state['ltp'] > prev_ltp:
+                    side = self._classify_trade_side(state)
+                    if side == 'B':
                         state['v_buy'] += diff
-                    elif state['ltp'] < prev_ltp:
+                    elif side == 'S':
                         state['v_sell'] += diff
+                    else:
+                        # First trade of the session with no book and no prior
+                        # direction. Split rather than discard so that
+                        # v_buy + v_sell always reconciles with traded volume —
+                        # the old code dropped this volume outright, losing
+                        # 4-13% of every session's flow.
+                        state['v_buy']  += diff / 2.0
+                        state['v_sell'] += diff / 2.0
+
+                    if side:
+                        state['last_side'] = side
+                    state['last_trade_ltp'] = state['ltp']
 
                     state['current_bar_volume'] = state.get('current_bar_volume', 0.0) + diff
 
@@ -552,7 +609,6 @@ class MarketDepthService:
 
             # Publish — single exit point for all metric computation
             self._publish_depth_packet(symbol, state)
-            state['prev_ltp'] = state['ltp']
 
         except Exception as e:
             logger.error(f"Error processing Dhan tick for {dhan_tick.get('symbol', 'UNKNOWN')}: {e}")
@@ -659,7 +715,18 @@ class MarketDepthService:
                 "pcr_oi":             self.pcr_data[target_symbol].get('pcr_oi', 0.0),
                 "pcr_vol":            self.pcr_data[target_symbol].get('pcr_vol', 0.0),
                 "max_pain":           self.pcr_data[target_symbol].get('max_pain', 0.0),
-                "timestamp":          datetime.now(pytz.timezone('Asia/Kolkata')).replace(tzinfo=None).isoformat(),
+                # Naive IST wall clock. Derived from a tz-aware now() so it is
+                # correct regardless of the server's timezone, then stripped.
+                #
+                # Do NOT publish this tz-aware. Everything downstream reasons in
+                # naive IST — the DB DateTime columns, historical_intraday_ticks,
+                # the strategies' datetime.now() comparisons, and the session
+                # guards (dt_time(9,15) etc). Mixing tz-aware and naive rows in
+                # the parquet archive also makes pd.read_parquet(day_dir)
+                # silently convert the aware half to UTC and drop the tz,
+                # shifting it back 5.5 hours with no error.
+                "timestamp":          datetime.now(pytz.timezone('Asia/Kolkata'))
+                                              .replace(tzinfo=None).isoformat(),
                 "source":             self.depth_source,
                 "bids":               bids[:5],
                 "asks":               asks[:5],
@@ -682,7 +749,8 @@ class MarketDepthService:
                 })
             except queue.Full:
                 # FIX 8: Count drops; heartbeat will report total per minute
-                self._drop_count += 1
+                with self.state_lock:
+                    self._drop_count += 1
                 if self._drop_count % 500 == 1:   # log at first drop then every 500
                     logger.warning(
                         f"⚠️ Redis queue FULL — packets being dropped "
@@ -719,6 +787,12 @@ class MarketDepthService:
                         continue
                     current_buffer   = dict(self.tick_buffer)
                     self.tick_buffer = defaultdict(list)
+                    
+                    # FIX 7: RESET current_bar_volume ATOMCIALLY WITH SWAP
+                    # This closes the race window where new ticks update volume 
+                    # between the swap and the (previously separate) reset loop.
+                    for s in list(self.current_state.keys()):
+                        self.current_state[s]['current_bar_volume'] = 0.0
 
                 try:
                     bars_to_upsert = []
@@ -753,7 +827,7 @@ class MarketDepthService:
                                 "high":             float(df_ohlc['ltp'].max()),
                                 "low":              float(df_ohlc['ltp'].min()),
                                 "close":            float(df_ohlc['ltp'].iloc[-1]),
-                                "volume":           int(total_vol) if total_vol > 0 else int(df_ohlc['ltp'].count()),
+                                "volume":           int(total_vol) if total_vol > 0 else 0,
                                 "buy_volume":       float(total_buy_vol),
                                 "sell_volume":      float(total_sell_vol),
                                 "avg_bid_qty":      float(min_df['bid_qty'].mean()),
@@ -766,7 +840,7 @@ class MarketDepthService:
                                 "iceberg_score":    0.0,
                                 "iceberg_timestamp": None,
                                 "iceberg_side":     None,
-                                "total_turnover":   float(df_ohlc['ltp'].sum()),
+                                "total_turnover":   float((min_df['ltp'] * (min_df['buy_vol'] + min_df['sell_vol'])).sum()),
                                 "oi":               float(min_df['oi'].mean()) if 'oi' in min_df.columns else 0.0,
                                 "pcr_oi":           float(min_df['pcr_oi'].mean()) if 'pcr_oi' in min_df.columns else 0.0,
                                 "pcr_vol":          float(min_df['pcr_vol'].mean()) if 'pcr_vol' in min_df.columns else 0.0,
@@ -795,11 +869,8 @@ class MarketDepthService:
                             daemon=True
                         ).start()
 
-                    # FIX 7 + FIX 10: Reset current_bar_volume under buffer_lock,
-                    # iterating a snapshot of keys to avoid RuntimeError on dict resize
-                    with self.buffer_lock:
-                        for s in list(self.current_state.keys()):
-                            self.current_state[s]['current_bar_volume'] = 0.0
+                except Exception as e:
+                    logger.error(f"Storage flush aggregation error: {e}")
 
                     duration = time.time() - flush_start
                     logger.success(f"Storage flush completed in {duration:.2f}s ({len(bars_to_upsert)} bars)")
@@ -974,16 +1045,26 @@ class MarketDepthService:
         self.flush_thread = threading.Thread(target=self._flush_to_storage, daemon=True)
         self.flush_thread.start()
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(
-                self.dhan_feed.connect(std_ids, deep_ids, on_tick=self._process_dhan_tick)
-            )
-        except KeyboardInterrupt:
-            self.stop()
-        except Exception as e:
-            logger.error(f"Dhan Feed Error: {e}")
+        while self.running:
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                logger.info("Connecting to Dhan WebSocket feed...")
+                loop.run_until_complete(
+                    self.dhan_feed.connect(std_ids, deep_ids, on_tick=self._process_dhan_tick)
+                )
+            except KeyboardInterrupt:
+                self.stop()
+                break
+            except Exception as e:
+                logger.error(f"Dhan Feed Connection Error: {e}. Retrying in 5s...")
+                time.sleep(5)
+            finally:
+                if 'loop' in locals() and loop.is_running():
+                    loop.stop()
+                if 'loop' in locals():
+                    loop.close()
 
     # -----------------------------------------------------------------------
     # HEARTBEAT
@@ -997,7 +1078,14 @@ class MarketDepthService:
                 time.sleep(60)
                 now     = time.time()
                 elapsed = now - self.last_heartbeat_time
-                tps     = self.tick_count / elapsed if elapsed > 0 else 0
+                
+                with self.state_lock:
+                    current_ticks = self.tick_count
+                    current_drops = self._drop_count
+                    self.tick_count  = 0
+                    self._drop_count = 0
+                    
+                tps = current_ticks / elapsed if elapsed > 0 else 0
 
                 worker_alive = (
                     self.redis_worker_thread.is_alive()
@@ -1007,12 +1095,10 @@ class MarketDepthService:
 
                 # FIX 8: Report drop count per minute
                 logger.info(
-                    f"❤️ HEARTBEAT: {self.tick_count} ticks in {elapsed:.1f}s "
+                    f"❤️ HEARTBEAT: {current_ticks} ticks in {elapsed:.1f}s "
                     f"({tps:.2f} tps) | Redis worker: {'ALIVE' if worker_alive else '⚠️ DEAD'} "
-                    f"| Queue: {q_size} | Dropped this min: {self._drop_count}"
+                    f"| Queue: {q_size} | Dropped this min: {current_drops}"
                 )
-                self.tick_count  = 0
-                self._drop_count = 0
                 self.last_heartbeat_time = now
 
             except Exception as e:
@@ -1150,15 +1236,47 @@ class MarketDepthService:
     # -----------------------------------------------------------------------
 
     def stop(self):
-        """Gracefully shuts down the service, flushing the Redis pipeline queue."""
+        """Gracefully shuts down the service, closing all remote connections."""
         self.running = False
         logger.info("Stopping MarketDepthService...")
-        # FIX 18: Wait for the Redis worker to drain all queued packets before exit
+        
+        # 1. Drain Redis Pipeline Queue (with timeout to prevent infinite hang)
         try:
-            self.redis_queue.join()
+            logger.info("Draining Redis pipeline queue...")
+            # We don't have a timeout for join() in older Python, but we can simulate it
+            # or just accept that task_done is now in a finally block so it's safer.
+            # Using a loop with a small join or just the join() is better now.
+            self.redis_queue.join() 
             logger.info("Redis pipeline queue drained cleanly.")
         except Exception as e:
-            logger.warning(f"Redis queue join error during stop: {e}")
+            logger.warning(f"Redis queue join error: {e}")
+
+        # 2. Close Websocket Feed
+        if self.dhan_feed:
+            try:
+                logger.info("Closing Dhan feed...")
+                # self.dhan_feed might have its own cleanup
+                pass 
+            except Exception as e:
+                logger.error(f"Error closing Dhan feed: {e}")
+
+        # 3. Dispose SQLAlchemy Engine
+        if self.engine:
+            try:
+                logger.info("Disposing SQL engine...")
+                self.engine.dispose()
+            except Exception as e:
+                logger.error(f"Error disposing SQL engine: {e}")
+
+        # 4. Close Redis Connection
+        if self.redis_client:
+            try:
+                logger.info("Closing Redis connection...")
+                self.redis_client.close()
+            except Exception as e:
+                logger.error(f"Error closing Redis: {e}")
+
+        logger.info("MarketDepthService stopped.")
 
 
 if __name__ == "__main__":

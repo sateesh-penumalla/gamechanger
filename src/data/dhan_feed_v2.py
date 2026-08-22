@@ -34,6 +34,12 @@ class DhanFeedClient:
         self._depth_state = defaultdict(lambda: {"bid": [], "ask": [], "ltp": 0.0, "volume": 0, "v_buy": 0, "v_sell": 0})
         # Mapping for security_id -> symbol
         self._id_to_symbol = {}
+        self._id_meta = {}
+
+        # Frame-walk diagnostics (see _parse_standard_binary)
+        self._frames_seen = 0
+        self._multi_packet_frames = 0
+        self._extra_packets = 0
 
     def set_id_meta_mapping(self, mapping: Dict[int, Dict[str, str]]):
         """Inject mapping from SecurityID (int) to Meta Dict {'symbol': str, 'segment': str}."""
@@ -196,11 +202,71 @@ class DhanFeedClient:
                 await asyncio.sleep(5)
 
     def _parse_standard_binary(self, data: bytes):
-        """Standard Feed: LTP, Volume, 5-Level Depth."""
+        """Standard Feed frame — may carry MULTIPLE packets.
+
+        The Dhan standard header is:
+            byte  0    feed response code
+            bytes 1-2  message length (uint16)
+            byte  3    exchange segment
+            bytes 4-7  security id
+
+        The length field exists precisely because a websocket frame can hold
+        several packets back to back — _parse_deep_binary already walks its
+        frames that way. This one used to read only the first record and drop
+        the remainder, which is the leading suspect for the coverage holes seen
+        in the archive (46.7% of volume arriving after >30s of silence).
+
+        The walk falls back to treating the frame as a single packet whenever
+        the length header looks unusable, so behaviour can never be worse than
+        before the change.
+        """
+        try:
+            n = len(data)
+            if n < 8:
+                return
+
+            declared = struct.unpack('<H', data[1:3])[0]
+            if declared < 8 or declared > n:
+                # Length header not usable — historical single-packet behaviour.
+                self._parse_standard_packet(data)
+                return
+
+            offset = 0
+            count = 0
+            while offset + 8 <= n:
+                msg_len = struct.unpack('<H', data[offset + 1:offset + 3])[0]
+                if msg_len < 8 or offset + msg_len > n:
+                    break
+                self._parse_standard_packet(data[offset:offset + msg_len])
+                offset += msg_len
+                count += 1
+
+            if count == 0:
+                self._parse_standard_packet(data)
+                return
+
+            # Diagnostic: how much was previously being discarded.
+            self._frames_seen += 1
+            if count > 1:
+                self._multi_packet_frames += 1
+                self._extra_packets += count - 1
+            if self._frames_seen % 20000 == 0:
+                logger.info(
+                    f"Frame stats: {self._frames_seen:,} frames | "
+                    f"{self._multi_packet_frames:,} multi-packet | "
+                    f"{self._extra_packets:,} packets recovered that the old "
+                    f"single-packet parser would have dropped"
+                )
+
+        except Exception as e:
+            logger.error(f"Error walking Standard Dhan frame: {e}")
+
+    def _parse_standard_packet(self, data: bytes):
+        """Parse ONE standard-feed packet."""
         try:
             if len(data) < 8: return
             feed_code = data[0]
-            
+
             if feed_code in [2, 4, 6, 8, 15, 16, 17]:
                 sec_id = struct.unpack('<I', data[4:8])[0]
                 ltp = struct.unpack('<f', data[8:12])[0]
