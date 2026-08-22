@@ -487,14 +487,14 @@ class MarketDepthService:
         quote prevailing at the time of the trade, not the one that replaces it
         afterwards. Do not move the depth update above this call.
         """
-        side, _src = classify_trade_side(
+        side, src = classify_trade_side(
             state.get('ltp', 0.0),
             state.get('bid_price', 0.0),
             state.get('ask_price', 0.0),
             state.get('last_trade_ltp', 0.0),
             state.get('last_side'),
         )
-        return side
+        return side, src
 
     def _process_dhan_tick(self, dhan_tick: dict):
         """Processes a normalized tick from DhanFeedClient."""
@@ -532,6 +532,7 @@ class MarketDepthService:
                 # last_trade_ltp / last_side drive the Lee-Ready tick-rule
                 # fallback in _classify_trade_side.
                 "last_trade_ltp": 0.0, "last_side": None,
+                "v_delta": 0.0, "last_src": None, "last_pub_ts": 0.0,
                 "bids": [], "asks": [],
                 "current_bar_volume": 0.0, "oi": 0.0
             }
@@ -554,7 +555,7 @@ class MarketDepthService:
                 if prev_vol > 0 and volume > prev_vol:
                     diff = volume - prev_vol
 
-                    side = self._classify_trade_side(state)
+                    side, src = self._classify_trade_side(state)
                     if side == 'B':
                         state['v_buy'] += diff
                     elif side == 'S':
@@ -571,6 +572,14 @@ class MarketDepthService:
                     if side:
                         state['last_side'] = side
                     state['last_trade_ltp'] = state['ltp']
+
+                    # Per-publish traded volume. Accumulated and reset in
+                    # _publish_depth_packet exactly like v_buy/v_sell, so a
+                    # packet always satisfies vol_delta == buy_vol + sell_vol.
+                    # Consumers must use this rather than differencing the
+                    # cumulative `volume` field themselves.
+                    state['v_delta'] = state.get('v_delta', 0.0) + diff
+                    state['last_src'] = src
 
                     state['current_bar_volume'] = state.get('current_bar_volume', 0.0) + diff
 
@@ -693,6 +702,15 @@ class MarketDepthService:
                     f"— running in L2 mode (no bids_20 published)"
                 )
 
+            # Time since this symbol's previous packet. A long gap means the
+            # accompanying vol_delta aggregates trading the feed never
+            # delivered — measured over the archive, a large share of volume
+            # arrives this way, so consumers need to see it.
+            now_mono = time.time()
+            last_pub = state.get('last_pub_ts', 0.0)
+            gap_secs = (now_mono - last_pub) if last_pub else 0.0
+            state['last_pub_ts'] = now_mono
+
             packet = {
                 "symbol":             target_symbol,
                 "ltp":                ltp,
@@ -712,6 +730,15 @@ class MarketDepthService:
                 "oi":                 state.get('oi', 0.0),
                 "buy_vol":            state.get('v_buy', 0.0),
                 "sell_vol":           state.get('v_sell', 0.0),
+                # Traded volume since the previous packet. `volume` above stays
+                # CUMULATIVE for the session; this is the delta consumers want.
+                "vol_delta":          state.get('v_delta', 0.0),
+                # Which Lee-Ready rule classified it: quote / tick / carry.
+                # Lets a strategy weight or ignore low-confidence attributions.
+                "side_src":           state.get('last_src'),
+                # Seconds since this symbol's previous packet. Large values mean
+                # the delta aggregates trading the feed did not deliver.
+                "secs_since_prev":    round(gap_secs, 3),
                 "pcr_oi":             self.pcr_data[target_symbol].get('pcr_oi', 0.0),
                 "pcr_vol":            self.pcr_data[target_symbol].get('pcr_vol', 0.0),
                 "max_pain":           self.pcr_data[target_symbol].get('max_pain', 0.0),
@@ -738,8 +765,10 @@ class MarketDepthService:
                 packet["asks_20"] = asks
 
             # FIX 3: Reset accumulators as float (was int 0)
-            state['v_buy']  = 0.0
-            state['v_sell'] = 0.0
+            state['v_buy']   = 0.0
+            state['v_sell']  = 0.0
+            state['v_delta'] = 0.0
+            state['last_src'] = None
 
             # Enqueue for Redis pipeline (non-blocking)
             try:

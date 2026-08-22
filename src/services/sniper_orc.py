@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from src.db.schema import Position, IntradayTick, SystemJob
 from src.services.portfolio_manager import PortfolioManager
 from src.utils.notifications import notify_new_signal
+from src.utils.depth_packet import PacketReader
 
 load_dotenv()
 
@@ -45,10 +46,6 @@ class SniperOrchestrator:
         
         # State: symbol -> deque of (timestamp, ltp, total_vol, buy_vol, sell_vol)
         self.history = defaultdict(lambda: deque())
-        self.prev_volume = defaultdict(int)
-        self.prev_buy_vol = defaultdict(int) 
-        self.prev_sell_vol = defaultdict(int)
-        
         self.vwap_num = defaultdict(float)
         self.vwap_den = defaultdict(float)
         self.last_reset_date = date.today()
@@ -65,7 +62,9 @@ class SniperOrchestrator:
 
         # Tracking for signal debouncing
         self.last_signal_time = {}
+        self.last_rejection_log = {} # To throttle "skipping" logs
         self.port_mgr = PortfolioManager()
+        self.pkt = PacketReader('SniperOrchestrator')
 
         logger.info("🎯 SniperOrchestrator Initialized (Elite V2 Mode). Monitoring Redis Ticks...")
 
@@ -82,9 +81,6 @@ class SniperOrchestrator:
     def _process_tick(self, packet):
         symbol = packet['symbol']
         ltp = packet['ltp']
-        volume = packet.get('volume', 0)
-        buy_vol = packet.get('buy_vol', 0)
-        sell_vol = packet.get('sell_vol', 0)
         now = datetime.now()
 
         # 1. Day Reset
@@ -93,30 +89,19 @@ class SniperOrchestrator:
             self.vwap_num.clear()
             self.vwap_den.clear()
             self.history.clear()
-            self.prev_volume.clear()
-            self.prev_buy_vol.clear()
-            self.prev_sell_vol.clear()
             self.last_reset_date = now.date()
 
-        # 2. Calculate Tick Deltas
-        prev_v = self.prev_volume.get(symbol, 0)
-        vol_delta = 0
-        if volume > prev_v:
-            vol_delta = volume - prev_v
-        elif volume > 0 and prev_v == 0:
-            vol_delta = volume # Session start
-        
-        buy_delta = buy_vol - self.prev_buy_vol.get(symbol, 0) if buy_vol >= self.prev_buy_vol.get(symbol, 0) else 0
-        sell_delta = sell_vol - self.prev_sell_vol.get(symbol, 0) if sell_vol >= self.prev_sell_vol.get(symbol, 0) else 0
+        # 2. Per-tick deltas.
+        # buy_vol/sell_vol in the packet are ALREADY per-publish deltas — the
+        # service resets them after every packet. Differencing them against a
+        # previous value (as this did) produced ~0 for both, so `aggression`
+        # was meaningless. vol_delta likewise comes straight from the packet.
+        vol_delta, buy_delta, sell_delta = self.pkt.deltas(packet)
 
         # Update Session Metrics
         if vol_delta > 0:
             self.vwap_num[symbol] += (ltp * vol_delta)
             self.vwap_den[symbol] += vol_delta
-        
-        self.prev_volume[symbol] = volume
-        self.prev_buy_vol[symbol] = buy_vol
-        self.prev_sell_vol[symbol] = sell_vol
 
         # 3. Update History Buffer
         self.history[symbol].append((now, ltp, vol_delta, buy_delta, sell_delta))
@@ -127,9 +112,9 @@ class SniperOrchestrator:
             self.history[symbol].popleft()
 
         # 4. Evaluate Strategy
-        self._evaluate_signals(symbol, ltp, now)
+        self._evaluate_signals(symbol, ltp, now, packet)
 
-    def _evaluate_signals(self, symbol, ltp, now):
+    def _evaluate_signals(self, symbol, ltp, now, packet):
         # Time Filter: 09:25 to 12:30
         curr_time = now.time()
         if not (dt_time(9, 25) <= curr_time <= dt_time(12, 30)):
@@ -184,17 +169,43 @@ class SniperOrchestrator:
         if (vol_5m >= 250000 and efficiency > 0.6 and 4.0 <= aggression <= 35.0 and 
             rvol >= 5.0 and pulses_15m >= 3 and trend_15m <= 2.0 and 
             0.2 <= vwap_dist <= 1.2 and range_15m <= 2.0):
-            self._trigger_order(symbol, "LONG", ltp, vwap_dist, rvol, pulses_15m, efficiency)
+            self._trigger_order(symbol, "LONG", ltp, vwap_dist, rvol, pulses_15m, efficiency, packet)
 
         # --- HOLY GRAIL SHORT SNIPER ---
         elif (vol_5m >= 250000 and efficiency < -5.0 and aggression <= 0.10 and 
               rvol >= 5.0 and pulses_15m >= 3 and trend_15m >= -2.0 and 
               -2.0 <= vwap_dist <= -0.5):
-            self._trigger_order(symbol, "SHORT", ltp, vwap_dist, rvol, pulses_15m, efficiency)
+            self._trigger_order(symbol, "SHORT", ltp, vwap_dist, rvol, pulses_15m, efficiency, packet)
 
-    def _trigger_order(self, symbol, side, ltp, vwap_dist, rvol, pulses, eff):
-        # 1. Redis Global Lock (Absolute Once-Per-Day per Stock)
+    def _round_to_tick(self, price, tick=0.05):
+        """Round price to the nearest tick size (NSE default 0.05)."""
+        return round(round(price / tick) * tick, 2)
+
+    def _get_config(self, session):
+        """Loads strategy presets and merges with DB overrides (using signal_generator job ID as central config)."""
+        try:
+            # 1. Load Strategy Presets
+            preset_file = os.path.join(os.path.dirname(__file__), '..', 'config', 'strategy_presets.json')
+            with open(preset_file, "r") as f:
+                presets = json.load(f)
+            config = presets.get("sateesh", {}).copy()
+
+            # 2. Merge with DB Job Config (Overrides) - Borrowing from signal_generator job config
+            from src.db.schema import SystemJob
+            job = session.query(SystemJob).filter_by(job_id='signal_generator').first()
+            if job and job.config:
+                config.update(job.config)
+            
+            return config
+        except Exception as e:
+            logger.error(f"Error loading Orchestrator config: {e}")
+            return {}
+
+
+    def _trigger_order(self, symbol, side, ltp, vwap_dist, rvol, pulses, eff, packet):
         now = datetime.now()
+        
+        # 1. Redis Global Lock (Absolute Once-Per-Day per Stock)
         lock_key = f"lock:trade:{symbol}:{now.date()}"
         if self.redis_client.exists(lock_key):
             return
@@ -203,6 +214,44 @@ class SniperOrchestrator:
         last_s = self.last_signal_time.get(symbol, datetime.min)
         if last_s.date() >= now.date():
             return
+
+        if ltp > 2500:
+            return
+        
+        # --- PRECISION BALANCE: 35% - 65% Filter ---
+        bid_p = packet.get('bid_pct', -50)
+        ask_p = packet.get('ask_pct', -50)
+
+        # Log Throttling (Show rejection only once every 30 seconds per symbol)
+        last_rej = self.last_rejection_log.get(symbol, datetime.min)
+        should_log = (now - last_rej).total_seconds() > 30
+
+        if bid_p == -50 or ask_p == -50:
+            if should_log:
+                logger.info(f"🛡️ skipping signal for {symbol} : {ltp} : NO BID% DATA")
+                self.last_rejection_log[symbol] = now
+            return
+
+        strength = bid_p if side == "LONG" else ask_p
+        
+        if side == "LONG" and strength < 48.0:
+            if should_log:
+                logger.info(f"🛡️ skipping long signal for {symbol} : {ltp} : BID% < 53% its {strength}%")
+                self.last_rejection_log[symbol] = now
+            return
+        if side == "SHORT" and strength > 45.0:
+            if should_log:
+                logger.info(f"🛡️ skipping short signal for {symbol} : {ltp} : BID% > 45% its {strength}%")
+                self.last_rejection_log[symbol] = now
+            return
+
+        if strength < 35.0 or strength > 65.0:
+            if should_log:
+                logger.info(f"🛡️ skipping signal for {symbol} : {ltp} : BID% is either less than 35 or more than 65. its {strength}%")
+                self.last_rejection_log[symbol] = now
+            return          
+   
+
 
         session = self.Session()
         try:
@@ -229,8 +278,9 @@ class SniperOrchestrator:
             logger.success(f"🎯 ELITE SNIPER {side}: {symbol} @ {ltp} | RVOL: {rvol:.1f} | Pulse: {pulses} | Dist: {vwap_dist:.2f}%")
             
             # 1% TP, 2% SL
-            sl_price = round(ltp * 0.98 if side == "LONG" else ltp * 1.02, 2)
-            tp_price = round(ltp * 1.01 if side == "LONG" else ltp * 0.99, 2)
+            ltp = self._round_to_tick(ltp)
+            sl_price = self._round_to_tick(ltp * 0.98 if side == "LONG" else ltp * 1.02)
+            tp_price = self._round_to_tick(ltp * 1.01 if side == "LONG" else ltp * 0.99)
 
             # Auto-Execute Check (Zero-Loss Protocol Rule 3)
             master_switch = os.getenv("ENABLE_AUTO_TRADING", "false").lower() == "true"
@@ -247,13 +297,22 @@ class SniperOrchestrator:
                 
                 with open(preset_file, "r") as f:
                     presets = json.load(f)
-                auto_exec = presets.get("sateesh", {}).get("auto_execute_sniper", False)
+
+                p = self._get_config(session)
+                auto_exec = False
+                if side == 'LONG' and p.get('auto_execute_long', False): 
+                    auto_exec = True
+                elif side == 'SHORT' and p.get('auto_execute_short', False):
+                    auto_exec = True
+
+                auto_exec = auto_exec and p.get("auto_execute_sniper", False)
+                
             except Exception as e:
                 logger.warning(f"Sniper: Could not load auto_execute config: {e}. Defaulting to FALSE.")
 
             if not auto_exec:
                 logger.info(f"🛡️ Sniper: {symbol} {side} signal detected but AUTO-EXECUTE is FALSE. Skipping position creation.")
-                return
+                return        
 
             new_pos = Position(
                 symbol=symbol,

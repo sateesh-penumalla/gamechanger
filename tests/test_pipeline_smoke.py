@@ -168,6 +168,55 @@ def test_frame_walker():
     check("unusable length header does not crash", True)
 
 
+def test_packet_contract():
+    """The published packet carries the fields consumers now depend on."""
+    print("\npacket contract")
+    svc = build_service()
+    svc.current_state["ACME"] = {"ltp": 100.0, "volume": 0, "v_buy": 0.0, "v_sell": 0.0,
+                                 "last_trade_ltp": 0.0, "last_side": None,
+                                 "v_delta": 0.0, "last_src": None, "last_pub_ts": 0.0}
+    for ltp, vol, b, a in [(100.00, 1_000, 99.99, 100.01),
+                           (100.02, 1_100, 100.00, 100.04),
+                           (100.01, 1_250, 100.00, 100.04)]:
+        svc._process_dhan_tick(tick("ACME", ltp, vol, b, a))
+
+    pkts = svc.tick_buffer["ACME"]
+    check("vol_delta present in every packet", all("vol_delta" in p for p in pkts))
+    check("side_src present", all("side_src" in p for p in pkts))
+    check("secs_since_prev present", all("secs_since_prev" in p for p in pkts))
+    check("volume is still cumulative (non-decreasing)",
+          [p["volume"] for p in pkts] == sorted(p["volume"] for p in pkts))
+    check("vol_delta == buy_vol + sell_vol in every packet",
+          all(abs(p["vol_delta"] - (p["buy_vol"] + p["sell_vol"])) < 1e-6 for p in pkts))
+    check("vol_delta sums to traded volume",
+          abs(sum(p["vol_delta"] for p in pkts) - 250) < 1e-6,
+          f'got {sum(p["vol_delta"] for p in pkts)}, expected 250')
+
+
+def test_packet_reader():
+    """Consumers read the contract one way, with a legacy fallback."""
+    print("\npacket reader")
+    from src.utils.depth_packet import PacketReader
+
+    r = PacketReader("test")
+    v, b, s = r.deltas({"symbol": "ACME", "vol_delta": 250.0,
+                        "buy_vol": 150.0, "sell_vol": 100.0, "volume": 9999})
+    check("uses vol_delta, not cumulative volume", (v, b, s) == (250.0, 150.0, 100.0), str((v, b, s)))
+
+    # Legacy service with no vol_delta: derive from the cumulative counter.
+    r2 = PacketReader("legacy")
+    r2.deltas({"symbol": "ACME", "volume": 1000, "buy_vol": 0, "sell_vol": 0})
+    v2, _, _ = r2.deltas({"symbol": "ACME", "volume": 1250, "buy_vol": 0, "sell_vol": 0})
+    check("legacy fallback derives 250 from cumulative", v2 == 250.0, str(v2))
+
+    v3, _, _ = r2.deltas({"symbol": "ACME", "volume": 900, "buy_vol": 0, "sell_vol": 0})
+    check("legacy fallback ignores backward steps", v3 == 0.0, str(v3))
+
+    check("cumulative_volume accessor", PacketReader.cumulative_volume({"volume": 5}) == 5.0)
+    check("stale_seconds accessor", PacketReader.stale_seconds({"secs_since_prev": 3.5}) == 3.5)
+    check("missing fields degrade to 0.0", PacketReader.stale_seconds({}) == 0.0)
+
+
 def test_classifier_units():
     print("\nclassifier")
     cases = [
@@ -189,7 +238,8 @@ def main():
     print("=" * 66)
     for fn in (test_no_seed_phantom, test_classification_reconciles,
                test_timestamps_naive_ist, test_storage_roundtrip,
-               test_frame_walker, test_classifier_units):
+               test_frame_walker, test_classifier_units,
+               test_packet_contract, test_packet_reader):
         try:
             fn()
         except Exception as e:

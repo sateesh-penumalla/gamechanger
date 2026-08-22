@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from src.db.schema import ORBSignal, Position
 from src.services.portfolio_manager import PortfolioManager
 from src.utils.notifications import notify_new_signal
+from src.utils.depth_packet import PacketReader
 
 load_dotenv()
 
@@ -59,7 +60,9 @@ class OrderFlowSniper:
         })
         
         self.last_signal_time = {}
+        self.last_rejection_log = {} # To throttle "skipping" logs
         self.port_mgr = PortfolioManager()
+        self.pkt = PacketReader('OrderFlowSniper')
         
         logger.info("OrderFlowSniper Initialized - Using 98.6th Percentile (Holy Grail Mode)")
 
@@ -86,7 +89,6 @@ class OrderFlowSniper:
     def _process_tick(self, packet):
         symbol = packet['symbol']
         ltp = packet['ltp']
-        total_vol = packet.get('volume', 0) # Cumulative session volume
         vwap = packet.get('vwap', ltp)
         now = datetime.now()
         
@@ -94,42 +96,42 @@ class OrderFlowSniper:
         
         state = self.bar_data[symbol]
         
+        # Per-tick deltas straight from the packet contract.
+        # This previously read 'buy_volume'/'sell_volume' — keys the service has
+        # never published (they are 'buy_vol'/'sell_vol') — so aggression was
+        # pinned at 0.0 for every symbol, all session. The aggression gate below
+        # therefore never did anything.
+        v_delta, b_delta, s_delta = self.pkt.deltas(packet)
+
         # 1. Bar Management (1-Minute Aggregation)
         if not state['start_time'] or (now - state['start_time']).total_seconds() >= 60:
-            # End of bar - shift volumes
             # End of bar - shift volumes
             if state['start_time']:
                 state['prev_1m_vols'].append(state['current_vol'])
                 state['prev_1m_buy_vols'].append(state['current_buy_vol'])
                 state['prev_1m_sell_vols'].append(state['current_sell_vol'])
                 state['prev_opens'].append(state['open_p'])
-            
-            # Start new bar
+
+            # Start new bar. All three accumulators reset together — buy/sell
+            # used to carry over from the session start, so they were never
+            # per-bar quantities at all.
             state['start_time'] = now
             state['open_p'] = ltp
             state['current_vol'] = 0
-            state['start_session_vol'] = total_vol
-            
-        # Update current bar volume
-        state['current_vol'] = total_vol - state.get('start_session_vol', total_vol)
-        
-        # Track buy/sell deltas
-        current_buy = packet.get('buy_volume', 0)
-        current_sell = packet.get('sell_volume', 0)
-        
-        if 'start_buy_vol' not in state:
-            state['start_buy_vol'] = current_buy
-            state['start_sell_vol'] = current_sell
-            
-        state['current_buy_vol'] = current_buy - state['start_buy_vol']
-        state['current_sell_vol'] = current_sell - state['start_sell_vol']
-        
+            state['current_buy_vol'] = 0
+            state['current_sell_vol'] = 0
+
+        # Accumulate this bar from the deltas
+        state['current_vol']      += v_delta
+        state['current_buy_vol']  += b_delta
+        state['current_sell_vol'] += s_delta
+
         state['last_price'] = ltp
         state['last_vwap'] = vwap
         
         # Guard: Post 9:16 AM only
         # Guard: Post 9:30 AM only (Zero-Loss Protocol Rule 1)
-        if now.time() < dt_time(9, 31):
+        if now.time() < dt_time(9, 23):
             return
         
         # 2. Trigger Check
@@ -177,7 +179,8 @@ class OrderFlowSniper:
                 if last_t.date() >= now.date():
                     return
 
-                    # 3. DB Guard (Absolute One-Trade-Per-Day per Stock for TODAY)
+                # 3. DB Guard (Absolute One-Trade-Per-Day per Stock for TODAY)
+                with self.Session() as session:
                     today = now.date()
                     existing_today = session.query(Position).filter(
                         Position.symbol == symbol,
@@ -194,29 +197,97 @@ class OrderFlowSniper:
 
                 logger.success(f"🎯 HOLY GRAIL SNIPER TRIGGER: {symbol} {side} @ {ltp} | Eff: {efficiency:.2f} | Agg: {aggression:.2f}")
                 
-                # SET LOCK IMMEDIATELY to prevent race conditions
-                self.redis_client.setex(lock_key, 86400, "1")
-                
                 self._generate_order(symbol, side, ltp, vwap, packet, efficiency, aggression, pulses)
-                self.last_signal_time[symbol] = now
+                # Note: last_signal_time is updated inside _generate_order on success or final blocks
+
+    def _round_to_tick(self, price, tick=0.05):
+        """Round price to the nearest tick size (NSE default 0.05)."""
+        return round(round(price / tick) * tick, 2)
+
+    def _get_config(self, session):
+        """Loads strategy presets and merges with DB overrides (using signal_generator job ID as central config)."""
+        try:
+            # 1. Load Strategy Presets
+            preset_file = os.path.join(os.path.dirname(__file__), '..', 'config', 'strategy_presets.json')
+            with open(preset_file, "r") as f:
+                presets = json.load(f)
+            config = presets.get("sateesh", {}).copy()
+
+            # 2. Merge with DB Job Config (Overrides) - Borrowing from signal_generator job config
+            from src.db.schema import SystemJob
+            job = session.query(SystemJob).filter_by(job_id='signal_generator').first()
+            if job and job.config:
+                config.update(job.config)
+            
+            return config
+        except Exception as e:
+            logger.error(f"Error loading Orchestrator config: {e}")
+            return {}
 
     def _generate_order(self, symbol, side, price, vwap, packet, efficiency, aggression, pulses):
+        if price > 2500:
+            return
+
+        # --- PRECISION BALANCE: 35% - 65% Filter ---
+        bid_p = packet.get('bid_pct', -50)
+        ask_p = packet.get('ask_pct', -50)
+
+        # Log Throttling (Show rejection only once every 30 seconds per symbol)
+        now = datetime.now()
+        last_rej = self.last_rejection_log.get(symbol, datetime.min)
+        should_log = (now - last_rej).total_seconds() > 30
+
+        if bid_p == -50 or ask_p == -50:
+            if should_log:
+                logger.info(f"🛡️ skipping signal for {symbol} : {price} : NO BID% DATA")
+                self.last_rejection_log[symbol] = now
+            return
+
+        strength = bid_p if side == "LONG" else ask_p
+        
+        if side == "LONG" and strength < 53.0:
+            if should_log:
+                logger.info(f"🛡️ skipping long signal for {symbol} : {price} : BID% < 53% its {strength}%")
+                self.last_rejection_log[symbol] = now
+            return
+        if side == "SHORT" and strength > 45.0:
+            if should_log:
+                logger.info(f"🛡️ skipping short signal for {symbol} : {price} : BID% > 45% its {strength}%")
+                self.last_rejection_log[symbol] = now
+            return
+
+        if strength < 35.0 or strength > 65.0:
+            if should_log:
+                logger.info(f"🛡️ skipping signal for {symbol} : {price} : BID% is either less than 35 or more than 65. its {strength}%")
+                self.last_rejection_log[symbol] = now
+            return          
+        
         with self.Session() as session:
             # --- FINAL REDUNDANT GUARD ---
-            today = datetime.now().date()
+            today = now.date()
             existing = session.query(Position).filter(
                 Position.symbol == symbol,
                 Position.date == today
             ).first()
             
             if existing:
+                self.last_signal_time[symbol] = now
                 logger.info(f"🛡️ Guard: skipping duplicate sniper signal for {symbol} (Found Today - Status: {existing.status})")
                 return
 
+            # SET LOCK IMMEDIATELY to prevent race conditions
+            lock_key = f"lock:trade:{symbol}:{today}"
+            self.redis_client.setex(lock_key, 86400, "1")
+            self.last_signal_time[symbol] = now
+
+            price = self._round_to_tick(price)
             # Entry/TP/SL logic (1% Target, 2% Stop)
             tp = round(price * 1.01 if side == "LONG" else price * 0.99, 2)
             sl = round(price * 0.98 if side == "LONG" else price * 1.02, 2)
             
+            tp = self._round_to_tick(tp)
+            sl = self._round_to_tick(sl)
+
             sig = ORBSignal(
                 symbol=symbol,
                 side=side,
@@ -255,7 +326,15 @@ class OrderFlowSniper:
                 preset_file = os.path.join(os.path.dirname(__file__), '..', 'config', 'strategy_presets.json')
                 with open(preset_file, "r") as f:
                     presets = json.load(f)
-                auto_exec = presets.get("sateesh", {}).get("auto_execute_sniper", False)
+
+                p = self._get_config(session)
+                auto_exec = False
+                if side == 'LONG' and p.get('auto_execute_long', False): 
+                    auto_exec = True
+                elif side == 'SHORT' and p.get('auto_execute_short', False):
+                    auto_exec = True
+
+                auto_exec = auto_exec and p.get("auto_execute_sniper", False)
                 
                 if auto_exec:
                     pos = Position(
