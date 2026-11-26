@@ -134,8 +134,16 @@ def _job(args):
                 "moved_rows": 0, "bad_shards": 0, "dropped_rows": 0}
 
 
+def _explicit(spec):
+    """--symbols accepts 'A,B,C' or '@path/to/list.txt'."""
+    if spec.startswith("@"):
+        return [x.strip() for x in open(spec[1:]) if x.strip()]
+    return [x.strip() for x in spec.split(",") if x.strip()]
+
+
 def main():
     ap = argparse.ArgumentParser(description="Normalize the tick archive.")
+    ap.add_argument("--symbols", help="comma-separated list, or @file with one per line")
     ap.add_argument("--symbol", help="single symbol")
     ap.add_argument("--all", action="store_true", help="every symbol")
     ap.add_argument("--src", default=SRC_ROOT)
@@ -144,11 +152,12 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="report without writing")
     args = ap.parse_args()
 
-    if not (args.symbol or args.all):
-        ap.error("pick a scope: --symbol SYM or --all")
+    if not (args.symbol or args.all or args.symbols):
+        ap.error("pick a scope: --symbol SYM, --symbols A,B,C, or --all")
 
     symbols = (
-        [args.symbol] if args.symbol
+        _explicit(args.symbols) if args.symbols
+        else [args.symbol] if args.symbol
         else sorted(s for s in os.listdir(args.src) if os.path.isdir(os.path.join(args.src, s)))
     )
 

@@ -88,6 +88,7 @@ class DhanDataClient:
                 symbol = str(row['SEM_TRADING_SYMBOL']).strip()
                 sec_id = int(row['SEM_SMST_SECURITY_ID'])
                 instr = str(row['SEM_INSTRUMENT_NAME']).strip().upper()
+                lot_size = int(float(row.get('SEM_LOT_UNITS', 1)))
                 
                 self._id_map[symbol] = sec_id
                 
@@ -99,7 +100,8 @@ class DhanDataClient:
                 self._meta_map[symbol] = {
                     "id": sec_id,
                     "instr": instr,
-                    "segment": segment
+                    "segment": segment,
+                    "lot_size": lot_size
                 }
 
             # Filter for NSE Futures
@@ -202,6 +204,12 @@ class DhanDataClient:
         if clean_symbol == "NSEI": clean_symbol = "NIFTY"
         if clean_symbol == "NSEBANK": clean_symbol = "BANKNIFTY"
         return self._id_map.get(clean_symbol)
+
+    def get_lot_size(self, symbol: str) -> int:
+        """Returns the minimum lot size for a symbol (default: 1)."""
+        clean_symbol = str(symbol).replace(".NS", "").replace("^", "").strip()
+        meta = self._meta_map.get(clean_symbol)
+        return meta.get("lot_size", 1) if meta else 1
 
     def get_selective_indices(self, index_names: List[str] = None) -> Dict[str, int]:
         """
@@ -595,9 +603,9 @@ class DhanDataClient:
                 "validity": "DAY",
                 "securityId": str(sec_id),
                 "quantity": int(qty),
-                "price": float(entry_price) if order_type == "LIMIT" else 0.0,
-                "targetPrice": float(target_price),
-                "stopLossPrice": float(sl_price),
+                "price": round(float(entry_price), 2) if order_type == "LIMIT" else 0.0,
+                "targetPrice": round(float(target_price), 2),
+                "stopLossPrice": round(float(sl_price), 2),
                 "webhookUrl": webhook_url
             }
             

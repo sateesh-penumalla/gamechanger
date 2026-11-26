@@ -891,6 +891,10 @@ class OrderFlowOrchestrator:
                 symbol, "SHORT", ltp, packet, is_l3, signal_type="VWAP_EXTENSION"
             )
 
+    def _round_to_tick(self, price, tick=0.05):
+        """Round price to the nearest tick size (NSE default 0.05)."""
+        return round(round(price / tick) * tick, 2)
+
     # -----------------------------------------------------------------------
     # SCANNER BREAKOUT (DISABLED)
     # -----------------------------------------------------------------------
@@ -926,6 +930,8 @@ class OrderFlowOrchestrator:
         self, symbol, side, ltp, packet, is_l3,
         anchor_price=None, signal_type="ORDERFLOW_ALPHA", max_extension=3.5
     ):
+        if ltp > 2500:
+            return
         # --- TIME WINDOW GUARD: 09:15 to 14:30 ---
         now_time   = datetime.now().time()
         start_time = dt_time(9, 1)
@@ -1108,9 +1114,9 @@ class OrderFlowOrchestrator:
             side        = side,
             date        = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
             timestamp   = datetime.now(),
-            entry_price = ltp,
-            sl          = round(float(sl), 2),
-            tp          = round(float(tp), 2),
+            entry_price = self._round_to_tick(ltp),
+            sl          = self._round_to_tick(sl),
+            tp          = self._round_to_tick(tp),
             signal_type = signal_type,
             metrics     = {
                 "vqs":              packet.get('vqs_score'),

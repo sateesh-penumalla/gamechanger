@@ -50,12 +50,13 @@ class OrderFlowOrchestrator:
         self.vwap_den = defaultdict(float)
         self.last_reset_date = date.today()
         self.prev_volume = defaultdict(int) # Track session volume for delta logic
+        self.prev_oi = defaultdict(float)  # Track OI for commitment logic
         self.pending_confirmation = {}  # symbol -> {side, trigger_price, trigger_time, packet}
           
         # Momentum Squeeze Confirmation Gate
         self.momentum_confirm_pct  = 0.1   # Price must move 0.1% in signal direction
-        self.momentum_confirm_secs = 90    # Within 30 seconds
-        self.momentum_start_time   = dt_time(9, 30)  # No signals before 9:30 (builds from 9:15)
+        self.momentum_confirm_secs = 90    # Within 90 seconds
+        self.momentum_start_time   = dt_time(9, 25)  # No signals before 9:25 (builds from 9:15)
         
         # Config
         self.min_iceberg_score = 0.8  # Tightened from 0.7
@@ -158,10 +159,17 @@ class OrderFlowOrchestrator:
         last_v = v_hist[-1] if v_hist else 0.0
         local_surge = last_v / avg_v if avg_v > 0 else 1.0
 
-        # Inject into packet to override upstream fields
+        # 6. Local OI Change
+        oi = packet.get('oi', 0.0)
+        p_oi = self.prev_oi[symbol]
+        oi_chg = oi - p_oi if p_oi > 0 else 0
+        self.prev_oi[symbol] = oi if oi > 0 else p_oi
+
+        # Inject into packet to override/complement upstream fields
         packet['vwap'] = local_vwap
         packet['vqs_score'] = local_vqs
         packet['vol_surge'] = local_surge
+        packet['oi_chg'] = oi_chg
         
         return packet
 
@@ -365,11 +373,12 @@ class OrderFlowOrchestrator:
         """
         Fallback system 1: Momentum Squeeze
         Triggers purely on extreme volume surges and price action quality.
-        Uses a 0.1% / 30s confirmation gate to avoid false signals.
-        Ticks accumulate from 9:15 but signals are only fired from 9:30.
+        Uses a 0.1% / 90s confirmation gate to avoid false signals.
+        Ticks accumulate from 9:15 but signals are only fired from 9:25.
         """
-        # Opening filter: local metrics warm up from 9:15 but no signals before 9:30
+        # Opening filter: local metrics warm up from 9:15 but no signals before 9:25
         now = datetime.now().time()
+        # logger.warning(f"Momentum check: now={now}, start={self.momentum_start_time}, pkt_ts={packet.get('timestamp')}")
         if now < self.momentum_start_time:
             return
 
@@ -465,7 +474,15 @@ class OrderFlowOrchestrator:
             logger.warning(f"🔍 SCANNER ALIGNMENT ({side}): {symbol} @ {ltp} | Surge: {vol_surge:.1f}x | Move: {price_move_pct:.2%}")
             self._evaluate_trigger(symbol, side, ltp, packet, is_l3, signal_type="SCANNER_BREAKOUT")
 
+    def _round_to_tick(self, price, tick=0.05):
+        """Round price to the nearest tick size (NSE default 0.05)."""
+        return round(round(price / tick) * tick, 2)
+
     def _evaluate_trigger(self, symbol, side, ltp, packet, is_l3, anchor_price=None, signal_type="ORDERFLOW_ALPHA"):
+
+        if ltp > 2500:
+          return
+
         # Filter by enabled signal types if configured
         if self.enabled_signals and signal_type not in self.enabled_signals:
             return
@@ -526,7 +543,8 @@ class OrderFlowOrchestrator:
             #     self._log_near_miss(session, symbol, side, ltp, packet, signal_type, [f"ORACLE_MISMATCH: {focus.oracle_status} vs {side}"])
             #     return
 
-            # --- PRECISION BALANCE: 35% - 65% Filter ---
+            # --- OI + CONVICTION GATE ---
+            oi_chg = packet.get('oi_chg', 0)
             bid_p = packet.get('bid_pct', -50)
             ask_p = packet.get('ask_pct', -50)
 
@@ -534,6 +552,17 @@ class OrderFlowOrchestrator:
                 self._log_near_miss(session, symbol, side, ltp, packet, signal_type, ["BID_ASK_PCT_MISSING"])
                 return
 
+            # OI Buildup Check (from improved snippet)
+            # If no OI buildup + weak book = Skip
+            if oi_chg <= 0:
+                if side == "LONG" and bid_p < 52.0:
+                    self._log_near_miss(session, symbol, side, ltp, packet, signal_type, [f"OI_GATE: No buildup + Bid {bid_p:.1f}% < 52.0%"])
+                    return
+                if side == "SHORT" and bid_p >= 45.0:
+                    self._log_near_miss(session, symbol, side, ltp, packet, signal_type, [f"OI_GATE: No buildup + Bid {bid_p:.1f}% >= 45.0%"])
+                    return
+
+            # --- PRECISION BALANCE: 35% - 65% Filter ---
             strength = bid_p if side == "LONG" else ask_p
             
             if side == "LONG" and strength < 53.0:
@@ -579,10 +608,10 @@ class OrderFlowOrchestrator:
             side=side,
             date=datetime.now().replace(hour=0, minute=0, second=0, microsecond=0),
             timestamp=datetime.now(),
-            entry_price=ltp,
-            sl=round(float(sl), 2),
-            tp=round(float(tp), 2),
-            signal_type=signal_type,
+            entry_price = self._round_to_tick(ltp),
+            sl          = self._round_to_tick(sl),
+            tp          = self._round_to_tick(tp),
+            signal_type = signal_type,
             metrics={
                 "vqs": packet.get('vqs_score'),
                 "imbalance": packet.get('imbalance'),
@@ -670,8 +699,8 @@ class OrderFlowOrchestrator:
                 timestamp=datetime.now(),
                 entry_price=ltp,
                 signal_type=signal_type,
-                sl=round(float(ltp * 0.98 if side == "LONG" else ltp * 1.02), 2),
-                tp=round(float(ltp * 1.01 if side == "LONG" else ltp * 0.99), 2),
+                sl=self._round_to_tick(ltp * 0.98 if side == "LONG" else ltp * 1.02),
+                tp=self._round_to_tick(ltp * 1.01 if side == "LONG" else ltp * 0.99),
                 fail_reasons=reasons,
                 metrics={
                     "vqs": packet.get('vqs_score'),
